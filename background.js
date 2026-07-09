@@ -125,6 +125,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.storage.local.get([STORAGE_KEYS.session], (result) => {
       const session = result[STORAGE_KEYS.session];
       const lines = Array.isArray(message.lines) ? message.lines : [];
+      // Explicit clears / O'Reilly sync / widget ✕ must be allowed to empty the cart.
+      const allowEmpty = message.allowEmpty === true;
 
       // Keep scraped lines even before a CRM session exists.
       if (!session) {
@@ -134,8 +136,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      // Don't wipe a populated cart with an accidental empty scrape.
-      if (lines.length === 0 && Array.isArray(session.lines) && session.lines.length > 0) {
+      // Don't wipe a populated cart with an accidental empty scrape —
+      // unless the caller explicitly allows empty (remove / authoritative sync).
+      if (
+        !allowEmpty &&
+        lines.length === 0 &&
+        Array.isArray(session.lines) &&
+        session.lines.length > 0
+      ) {
         sendResponse({ ok: true, session, ignoredEmpty: true });
         return;
       }
@@ -223,5 +231,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     showWidgetOnOreillyTabs();
     sendResponse({ ok: true });
     return;
+  }
+
+  // Widget Refresh → content script re-fetches FirstCall miniquote.
+  if (message.type === 'AMI_SCRAPE_NOW') {
+    const tabId = sender.tab?.id;
+    if (tabId == null) {
+      sendResponse({ ok: false, error: 'No tab for scrape' });
+      return;
+    }
+    chrome.tabs.sendMessage(tabId, { type: 'AMI_SCRAPE_NOW' }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({
+          ok: false,
+          error: chrome.runtime.lastError.message || 'Scrape failed'
+        });
+        return;
+      }
+      sendResponse(response ?? { ok: true });
+    });
+    return true;
   }
 });

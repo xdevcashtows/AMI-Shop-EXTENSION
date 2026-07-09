@@ -157,7 +157,6 @@ function render() {
       <td>${escapeHtml(line.description || '')}</td>
       <td>${escapeHtml(String(line.quantity ?? 1))}</td>
       <td>${money(line.cost)}</td>
-      <td>${money(line.listPrice ?? line.sellPrice)}</td>
       <td></td>
     `;
     const removeBtn = document.createElement('button');
@@ -189,12 +188,21 @@ async function removeLine(index) {
   if (!currentSession) return;
   const lines = [...(currentSession.lines || [])];
   lines.splice(index, 1);
-  const response = await sendMessage({ type: 'AMI_UPDATE_CART', lines });
+  const response = await sendMessage({
+    type: 'AMI_UPDATE_CART',
+    lines,
+    allowEmpty: true
+  });
   if (response?.error) {
     setStatus(response.error, 'err');
     return;
   }
-  if (response?.session) currentSession = response.session;
+  if (response?.session) {
+    currentSession = response.session;
+  } else {
+    currentSession = { ...currentSession, lines };
+  }
+  setStatus(lines.length ? 'Part removed from shop cart' : 'Shop cart cleared', 'ok');
   render();
 }
 
@@ -225,8 +233,16 @@ els.fillVinBtn.addEventListener('click', () => {
 els.refreshBtn.addEventListener('click', () => {
   postToParent('AMI_WIDGET_SCRAPE_NOW');
   setStatus('Refreshing cart…');
-  window.setTimeout(() => void load(), 500);
-  window.setTimeout(() => void load(), 1600);
+  window.setTimeout(() => void load(), 600);
+  window.setTimeout(() => void load(), 1400);
+  window.setTimeout(async () => {
+    await load();
+    const count = Array.isArray(currentSession?.lines) ? currentSession.lines.length : 0;
+    setStatus(
+      count ? `Cart refreshed · ${count} part${count === 1 ? '' : 's'}` : 'Cart refreshed · empty',
+      'ok'
+    );
+  }, 2200);
 });
 
 els.addTestBtn.addEventListener('click', async () => {
@@ -242,7 +258,6 @@ els.addTestBtn.addEventListener('click', async () => {
       brand: 'Test',
       quantity: 1,
       cost: 4.25,
-      listPrice: 9.99,
       vendor: currentSession.supplier === 'napa' ? 'NAPA' : "O'Reilly",
       unit: 'pc.'
     }

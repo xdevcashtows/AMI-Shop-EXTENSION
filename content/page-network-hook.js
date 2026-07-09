@@ -3,15 +3,17 @@
   window.__amiPartsBridgeNetHooked = true;
 
   const SOURCE = 'ami-parts-bridge-network';
+  const FETCH_SOURCE = 'ami-parts-bridge-fetch-miniquote';
 
-  function emit(url, body, kind) {
+  function emit(url, body, kind, method) {
     try {
       window.postMessage(
         {
           source: SOURCE,
           url: String(url || ''),
           body,
-          kind: kind || 'response'
+          kind: kind || 'response',
+          method: method || ''
         },
         '*'
       );
@@ -32,20 +34,121 @@
     return '';
   }
 
+  function csrfToken() {
+    try {
+      const meta = document.querySelector(
+        'meta[name="csrf-token"], meta[name="_csrf"], meta[name="CSRF-TOKEN"], meta[name="csrfToken"]'
+      );
+      if (meta && meta.getAttribute('content')) return meta.getAttribute('content');
+    } catch (_) {
+      // ignore
+    }
+    try {
+      const input = document.querySelector(
+        'input[name="_csrf"], input[name="csrf"], input[name="csrfToken"]'
+      );
+      if (input && input.value) return input.value;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      const match = document.cookie.match(
+        /(?:^|;\s*)(?:XSRF-TOKEN|csrfToken|CSRF-TOKEN|_csrf)=([^;]+)/i
+      );
+      if (match) return decodeURIComponent(match[1]);
+    } catch (_) {
+      // ignore
+    }
+    try {
+      // Page-world only: FirstCall / Angular sometimes expose the token on window.
+      const candidates = [
+        window.csrfToken,
+        window._csrf,
+        window.CSRF_TOKEN,
+        window.csrf,
+        window.__csrfToken
+      ];
+      for (const value of candidates) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+    } catch (_) {
+      // ignore
+    }
+    return '';
+  }
+
+  // Capture CSRF from FirstCall's own XHR/fetch headers for later refresh calls.
+  let lastCsrfFromHeader = '';
+  function rememberCsrfFromHeaders(headers) {
+    try {
+      if (!headers) return;
+      const token =
+        (typeof headers.get === 'function' &&
+          (headers.get('x-csrf-token') || headers.get('X-CSRF-TOKEN'))) ||
+        '';
+      if (token) lastCsrfFromHeader = token;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  /** Page-context fetch so FirstCall session cookies / CSRF apply. */
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.source !== FETCH_SOURCE) return;
+    const worksheetId = String(data.worksheetId || '').trim();
+    if (!/^\d+$/.test(worksheetId)) {
+      emit('', JSON.stringify({ error: 'missing worksheet id' }), 'response', 'GET');
+      return;
+    }
+    const url = `/FirstCallOnline/worksheet/rest/v2/miniquote/${worksheetId}`;
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest'
+    };
+    const token = csrfToken() || lastCsrfFromHeader;
+    if (token) headers['x-csrf-token'] = token;
+
+    fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
+      .then((response) => response.text().then((text) => ({ response, text })))
+      .then(({ response, text }) => {
+        emit(response.url || url, text, 'response', 'GET');
+      })
+      .catch(() => {
+        emit(url, JSON.stringify({ quoteDetails: [], totalItems: 0 }), 'response', 'GET');
+      });
+  });
+
   const origFetch = window.fetch;
   if (typeof origFetch === 'function') {
     window.fetch = async function (...args) {
+      let method = 'GET';
+      let url = '';
       try {
         const input = args[0];
         const init = args[1] || {};
-        const url =
+        url =
           typeof input === 'string'
             ? input
             : (input && input.url) || '';
-        const method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+        method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+        try {
+          const hdrs = init.headers;
+          if (hdrs) {
+            if (typeof hdrs.get === 'function') {
+              rememberCsrfFromHeaders(hdrs);
+            } else if (typeof hdrs === 'object') {
+              const token = hdrs['x-csrf-token'] || hdrs['X-CSRF-TOKEN'] || hdrs['X-Csrf-Token'];
+              if (token) lastCsrfFromHeader = String(token);
+            }
+          }
+        } catch (_) {
+          // ignore
+        }
         if (method !== 'GET' && method !== 'HEAD') {
           const reqBody = bodyToText(init.body);
-          if (reqBody) emit(url, reqBody, 'request');
+          if (reqBody) emit(url, reqBody, 'request', method);
         }
       } catch (_) {
         // ignore
@@ -54,13 +157,13 @@
       const response = await origFetch.apply(this, args);
       try {
         const clone = response.clone();
-        const url =
+        const responseUrl =
           typeof args[0] === 'string'
             ? args[0]
-            : (args[0] && args[0].url) || '';
+            : (args[0] && args[0].url) || url;
         clone
           .text()
-          .then((text) => emit(url, text, 'response'))
+          .then((text) => emit(responseUrl, text, 'response', method))
           .catch(() => {});
       } catch (_) {
         // ignore
@@ -72,24 +175,40 @@
   const OrigXHR = window.XMLHttpRequest;
   if (OrigXHR) {
     const open = OrigXHR.prototype.open;
+    const setRequestHeader = OrigXHR.prototype.setRequestHeader;
     const send = OrigXHR.prototype.send;
     OrigXHR.prototype.open = function (method, url, ...rest) {
       this.__amiUrl = url;
       this.__amiMethod = method;
       return open.call(this, method, url, ...rest);
     };
+    OrigXHR.prototype.setRequestHeader = function (name, value) {
+      try {
+        if (String(name).toLowerCase() === 'x-csrf-token' && value) {
+          lastCsrfFromHeader = String(value);
+        }
+      } catch (_) {
+        // ignore
+      }
+      return setRequestHeader.call(this, name, value);
+    };
     OrigXHR.prototype.send = function (...args) {
       try {
         const method = String(this.__amiMethod || 'GET').toUpperCase();
         if (method !== 'GET' && method !== 'HEAD' && args[0] != null) {
-          emit(this.__amiUrl || '', bodyToText(args[0]), 'request');
+          emit(this.__amiUrl || '', bodyToText(args[0]), 'request', method);
         }
       } catch (_) {
         // ignore
       }
       this.addEventListener('load', function () {
         try {
-          emit(this.__amiUrl || '', this.responseText || '', 'response');
+          emit(
+            this.__amiUrl || '',
+            this.responseText || '',
+            'response',
+            String(this.__amiMethod || 'GET').toUpperCase()
+          );
         } catch (_) {
           // ignore
         }

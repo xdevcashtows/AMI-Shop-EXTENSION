@@ -7,6 +7,8 @@
   let networkLines = [];
   /** @type {string} */
   let lastSentSignature = '';
+  /** @type {string} */
+  let lastWorksheetId = '';
   let dead = false;
 
   function markDead() {
@@ -199,7 +201,7 @@
       ) || 1
     );
 
-    // FirstCall: itemCost = shop cost, customerPrice/listPrice = sell/list
+    // FirstCall: itemCost = shop cost (only cost is transferred; list/sell ignored)
     const cost = parseMoney(
       record.itemCost ??
         record.cost ??
@@ -209,17 +211,6 @@
         record.salePrice ??
         record.netPrice ??
         record.unitPrice
-    );
-
-    const listPrice = parseMoney(
-      record.customerPrice ??
-        record.listPrice ??
-        record.list ??
-        record.retailPrice ??
-        record.msrp ??
-        record.priceExtended ??
-        record.sellPrice ??
-        record.price
     );
 
     const brand = String(
@@ -249,8 +240,6 @@
       brand: brand || undefined,
       quantity,
       cost,
-      listPrice,
-      sellPrice: listPrice,
       vendor: VENDOR,
       unit: 'pc.',
       storeName: storeName || undefined,
@@ -280,15 +269,14 @@
       // Prefer the richer quote line (real title + cost).
       if (
         (line._hasRealDescription && !prev._hasRealDescription) ||
-        (line.cost != null && prev.cost == null) ||
-        (line.listPrice != null && prev.listPrice == null)
+        (line.cost != null && prev.cost == null)
       ) {
         map.set(key, { ...prev, ...line });
       }
     }
 
-    // Prefer miniquote summary when present (clean line list).
-    if (Array.isArray(data?.quoteDetails) && data.quoteDetails.length) {
+    // Prefer miniquote summary when present (clean line list, including empty = cleared).
+    if (Array.isArray(data?.quoteDetails)) {
       data.quoteDetails.forEach((detail) => push(detail));
       return Array.from(map.values());
     }
@@ -372,7 +360,6 @@
         brand: line.brand || prev.brand,
         quantity: line.quantity || prev.quantity,
         cost: line.cost ?? prev.cost,
-        listPrice: line.listPrice ?? prev.listPrice,
         storeName: line.storeName || prev.storeName,
         externalId: line.externalId || prev.externalId,
         vendor: line.vendor || prev.vendor || VENDOR,
@@ -456,17 +443,79 @@
     }
   }
 
+  function rememberWorksheetId(sourceHint) {
+    const hint = String(sourceHint || '');
+    const match =
+      hint.match(/\/worksheet\/rest\/(?:v2\/miniquote|enterprise)\/(\d+)/i) ||
+      hint.match(/\/worksheet\/(\d+)(?:\/|\.html|\?|#|$)/i);
+    if (match?.[1]) lastWorksheetId = match[1];
+  }
+
+  function resolveWorksheetId() {
+    if (lastWorksheetId) return lastWorksheetId;
+    rememberWorksheetId(window.location.href);
+    if (lastWorksheetId) return lastWorksheetId;
+    try {
+      // Quote page links / breadcrumbs sometimes expose the worksheet id.
+      const anchors = document.querySelectorAll('a[href*="/worksheet/"]');
+      for (const anchor of anchors) {
+        rememberWorksheetId(anchor.getAttribute('href') || '');
+        if (lastWorksheetId) return lastWorksheetId;
+      }
+    } catch {
+      // ignore
+    }
+    return lastWorksheetId;
+  }
+
+  function readCsrfToken() {
+    try {
+      const meta = document.querySelector(
+        'meta[name="csrf-token"], meta[name="_csrf"], meta[name="CSRF-TOKEN"], meta[name="csrfToken"]'
+      );
+      const content = meta?.getAttribute('content');
+      if (content) return content;
+    } catch {
+      // ignore
+    }
+    try {
+      const input = document.querySelector(
+        'input[name="_csrf"], input[name="csrf"], input[name="csrfToken"]'
+      );
+      if (input instanceof HTMLInputElement && input.value) return input.value;
+    } catch {
+      // ignore
+    }
+    try {
+      const match = document.cookie.match(
+        /(?:^|;\s*)(?:XSRF-TOKEN|csrfToken|CSRF-TOKEN|_csrf)=([^;]+)/i
+      );
+      if (match) return decodeURIComponent(match[1]);
+    } catch {
+      // ignore
+    }
+    return '';
+  }
+
   function isFirstCallQuoteUrl(sourceHint) {
     const hint = String(sourceHint || '').toLowerCase();
     return (
       /\/worksheet\/rest\/.*\/addproducts\//i.test(hint) ||
       /\/worksheet\/rest\/.*\/miniquote\//i.test(hint) ||
+      /\/worksheet\/rest\/enterprise\/\d+\/products\//i.test(hint) ||
       /\/worksheet\/rest\/.*\/(update|remove|delete).*product/i.test(hint)
     );
   }
 
-  function isCartMutationPayload(data, sourceHint, kind) {
+  function isFirstCallProductDeleteUrl(sourceHint) {
+    return /\/worksheet\/rest\/enterprise\/\d+\/products\/\d+/i.test(
+      String(sourceHint || '')
+    );
+  }
+
+  function isCartMutationPayload(data, sourceHint, kind, method) {
     const hint = `${String(sourceHint || '')} ${kind || ''}`.toLowerCase();
+    const httpMethod = String(method || '').toUpperCase();
 
     // Ignore analytics / session noise
     if (/google-analytics|fullstory|signals\/interactions|g\/collect/i.test(hint)) {
@@ -475,6 +524,12 @@
 
     // Primary FirstCall quote APIs (responses only — request bodies are stubs)
     if (isFirstCallQuoteUrl(hint)) {
+      return kind !== 'request';
+    }
+
+    // DELETE /products/:id responses update totals but may omit quoteDetails —
+    // still treat as a cart mutation so we can clear / re-fetch.
+    if (httpMethod === 'DELETE' && isFirstCallProductDeleteUrl(hint)) {
       return kind !== 'request';
     }
 
@@ -487,10 +542,69 @@
     return false;
   }
 
-  function ingestPayload(payload, sourceHint, kind) {
+  function applyQuoteLines(quoteLines) {
+    networkLines = quoteLines.map((line) => {
+      const { _hasRealDescription, ...rest } = line;
+      return rest;
+    });
+    if (networkLines.length) {
+      networkLines = enrichDescriptionFromDom(networkLines);
+    }
+    void pushCartUpdate(true);
+  }
+
+  async function fetchMiniquote(worksheetId) {
+    const url = `/FirstCallOnline/worksheet/rest/v2/miniquote/${worksheetId}`;
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest'
+    };
+    const token = readCsrfToken();
+    if (token) headers['x-csrf-token'] = token;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      headers,
+      cache: 'no-store'
+    });
+    const text = await response.text();
+    ingestPayload(text, response.url || url, 'response', 'GET');
+    return response.ok;
+  }
+
+  function requestMiniquoteRefresh() {
+    const worksheetId = resolveWorksheetId();
+    if (!worksheetId) {
+      // No worksheet yet — push whatever we already have (often empty).
+      void pushCartUpdate(true);
+      return false;
+    }
+
+    // Prefer same-origin fetch from the content script (cookies apply).
+    void fetchMiniquote(worksheetId).catch(() => {
+      // Fallback: ask the page-world hook (can see page JS CSRF vars).
+      try {
+        window.postMessage(
+          {
+            source: 'ami-parts-bridge-fetch-miniquote',
+            worksheetId
+          },
+          '*'
+        );
+      } catch {
+        void pushCartUpdate(true);
+      }
+    });
+    return true;
+  }
+
+  function ingestPayload(payload, sourceHint, kind, method) {
     if (payload == null) return;
     // Never build the cart from add-request stubs (productKey + qty only).
     if (kind === 'request') return;
+
+    rememberWorksheetId(sourceHint);
 
     let data = payload;
     if (typeof payload === 'string') {
@@ -507,20 +621,31 @@
       }
     }
 
-    if (!isCartMutationPayload(data, sourceHint, kind)) {
+    if (!isCartMutationPayload(data, sourceHint, kind, method)) {
       return;
     }
 
-    // FirstCall quote APIs: replace shop cart from worksheet lines.
+    const httpMethod = String(method || '').toUpperCase();
+    const hasQuoteDetailsArray = Array.isArray(data?.quoteDetails);
+
+    // FirstCall miniquote (or any payload with quoteDetails): replace cart, including empty.
+    if (hasQuoteDetailsArray) {
+      applyQuoteLines(extractFirstCallQuoteLines(data));
+      return;
+    }
+
+    // DELETE product: response is worksheet totals without quoteDetails — clear then re-fetch.
+    if (httpMethod === 'DELETE' && isFirstCallProductDeleteUrl(sourceHint)) {
+      networkLines = [];
+      void pushCartUpdate(true);
+      requestMiniquoteRefresh();
+      return;
+    }
+
+    // FirstCall quote APIs: replace shop cart from worksheet lines when present.
     const quoteLines = extractFirstCallQuoteLines(data);
     if (quoteLines.length) {
-      networkLines = quoteLines.map((line) => {
-        const { _hasRealDescription, ...rest } = line;
-        return rest;
-      });
-      // Only DOM-enrich if a line still lacks a real title.
-      networkLines = enrichDescriptionFromDom(networkLines);
-      void pushCartUpdate(true);
+      applyQuoteLines(quoteLines);
       return;
     }
 
@@ -565,7 +690,7 @@
       if (event.source !== window) return;
       const data = event.data;
       if (!data || data.source !== 'ami-parts-bridge-network') return;
-      ingestPayload(data.body, data.url, data.kind);
+      ingestPayload(data.body, data.url, data.kind, data.method);
     });
   }
 
@@ -664,7 +789,6 @@
       const moneyMatches = fullText.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
       const amounts = moneyMatches.map(parseMoney).filter((n) => n != null);
       const cost = amounts.length ? amounts[0] : undefined;
-      const listPrice = amounts.length > 1 ? amounts[1] : undefined;
       const brand = textOf(row.querySelector('[class*="brand" i], [class*="manufacturer" i], [class*="line" i]'));
 
       if (!partNumber && !/\$/.test(fullText)) continue;
@@ -680,7 +804,6 @@
         brand: brand || undefined,
         quantity,
         cost,
-        listPrice,
         vendor: VENDOR,
         unit: 'pc.'
       });
@@ -712,18 +835,24 @@
 
     const lines = scrapeCartLines();
     const signature = JSON.stringify(
-      lines.map((l) => [l.partNumber, l.description, l.quantity, l.cost, l.listPrice])
+      lines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
     );
     if (!force && signature === lastSentSignature) return;
 
     lastSentSignature = signature;
-    const response = await Ami.sendMessage({ type: 'AMI_UPDATE_CART', lines });
+    // Network / quote sync is authoritative — empty carts must clear the widget.
+    const response = await Ami.sendMessage({
+      type: 'AMI_UPDATE_CART',
+      lines,
+      allowEmpty: true
+    });
     if (response?.error && /invalidated|refresh this tab/i.test(response.error)) {
       markDead();
     }
   }
 
   installNetworkHooks();
+  rememberWorksheetId(window.location.href);
 
   window.__amiTryFillVin = tryFillVin;
 
@@ -743,7 +872,10 @@
   });
 
   window.addEventListener('ami-parts-bridge-scrape-now', () => {
-    void pushCartUpdate(true);
+    // Re-fetch FirstCall miniquote so removals / qty changes sync into the shop cart.
+    if (!requestMiniquoteRefresh()) {
+      void pushCartUpdate(true);
+    }
   });
 
   document.addEventListener(
@@ -754,6 +886,25 @@
       const label = `${target.textContent || ''} ${target.getAttribute('aria-label') || ''} ${target.getAttribute('title') || ''}`.toLowerCase();
       if (/add.*quote|add.*cart|update.*quote|update.*cart/.test(label)) {
         window.setTimeout(() => void pushCartUpdate(true), 900);
+      }
+      // FirstCall remove controls — re-fetch after the DELETE + miniquote settle.
+      let looksLikeRemove = /remove|delete|trash/.test(label);
+      if (!looksLikeRemove) {
+        try {
+          looksLikeRemove = Boolean(
+            target.closest(
+              '[class*="remove" i], [class*="delete" i], [aria-label*="remove" i], [title*="remove" i]'
+            )
+          );
+        } catch {
+          looksLikeRemove = Boolean(
+            target.closest('[class*="remove"], [class*="delete"], [aria-label*="remove"], [title*="remove"]')
+          );
+        }
+      }
+      if (looksLikeRemove) {
+        window.setTimeout(() => requestMiniquoteRefresh(), 400);
+        window.setTimeout(() => requestMiniquoteRefresh(), 1200);
       }
     },
     true
@@ -768,15 +919,42 @@
       return true;
     }
     if (message?.type === 'AMI_SCRAPE_NOW') {
-      void pushCartUpdate(true).then(() => {
-        sendResponse({ ok: true, lines: scrapeCartLines() });
-      });
+      const started = requestMiniquoteRefresh();
+      window.setTimeout(() => {
+        sendResponse({
+          ok: true,
+          started,
+          worksheetId: resolveWorksheetId() || null,
+          lines: scrapeCartLines()
+        });
+      }, 900);
       return true;
     }
     if (message?.type === 'AMI_SESSION_UPDATED' && message.resetCart) {
       resetCart();
       sendResponse({ ok: true });
       return;
+    }
+  });
+
+  // Keep in-page cart mirror aligned when the widget ✕ removes lines from storage.
+  Ami?.onStorageChanged((changes, area) => {
+    if (area !== 'local' || !changes.amiPartsBridgeSession) return;
+    const next = changes.amiPartsBridgeSession.newValue;
+    if (!next) {
+      networkLines = [];
+      lastSentSignature = '';
+      return;
+    }
+    const nextLines = Array.isArray(next.lines) ? next.lines : [];
+    const nextSig = JSON.stringify(
+      nextLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
+    );
+    // Only adopt when storage is ahead of (or emptier than) our local mirror —
+    // avoids fighting an in-flight FirstCall sync.
+    if (nextSig !== lastSentSignature) {
+      networkLines = nextLines.map((line) => ({ ...line }));
+      lastSentSignature = nextSig;
     }
   });
 })();

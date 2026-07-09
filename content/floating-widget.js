@@ -485,6 +485,17 @@
 
     if (data.type === 'AMI_WIDGET_SCRAPE_NOW') {
       window.dispatchEvent(new CustomEvent('ami-parts-bridge-scrape-now'));
+      // Also poke the cart content script via runtime in case the custom event is missed.
+      void Ami.sendMessage({ type: 'AMI_SCRAPE_NOW' }).then((response) => {
+        if (response?.error && /invalidated|refresh/i.test(response.error)) {
+          markDead(response.error);
+          notifyWidgetStatus(response.error, 'err');
+          return;
+        }
+        if (response?.ok === false && response.error) {
+          notifyWidgetStatus(response.error, 'err');
+        }
+      });
     }
   });
 
