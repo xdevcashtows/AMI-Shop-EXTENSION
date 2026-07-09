@@ -3,6 +3,8 @@
   const PONG = 'ami-parts-bridge-pong';
   const SESSION_EVENT = 'ami-parts-bridge-session';
 
+  let detached = false;
+
   /** Local alive check — never throws. */
   function isAlive() {
     try {
@@ -15,9 +17,22 @@
     }
   }
 
+  /** After an extension reload this content script is orphaned — stop listening. */
+  function detach() {
+    if (detached) return;
+    detached = true;
+    try {
+      window.removeEventListener(PING, onPing);
+      window.removeEventListener(SESSION_EVENT, onSession);
+    } catch (_error) {
+      // ignore
+    }
+  }
+
   function safeSend(message) {
     return new Promise((resolve) => {
       if (!isAlive()) {
+        detach();
         resolve({
           ok: false,
           error: 'Extension was reloaded — refresh this CRM tab'
@@ -29,6 +44,7 @@
           try {
             const err = chrome.runtime.lastError;
             if (err) {
+              if (/invalidated/i.test(err.message || '')) detach();
               resolve({
                 ok: false,
                 error: /invalidated/i.test(err.message || '')
@@ -39,6 +55,7 @@
             }
             resolve(response ?? { ok: true });
           } catch (_error) {
+            detach();
             resolve({
               ok: false,
               error: 'Extension was reloaded — refresh this CRM tab'
@@ -46,6 +63,7 @@
           }
         });
       } catch (_error) {
+        detach();
         resolve({
           ok: false,
           error: 'Extension was reloaded — refresh this CRM tab'
@@ -56,10 +74,13 @@
 
   function onPing() {
     try {
-      if (!isAlive()) return;
+      if (!isAlive()) {
+        detach();
+        return;
+      }
       window.dispatchEvent(new CustomEvent(PONG));
     } catch (_error) {
-      // Swallow — stale content script after extension reload.
+      detach();
     }
   }
 
@@ -68,10 +89,10 @@
       const detail = event?.detail;
       if (!detail || !detail.sessionId || !detail.bridgeToken) return;
 
+      // Session is also passed via the FirstCall launch URL hash, so a dead
+      // CRM bridge is non-fatal — detach quietly and let the O'Reilly tab handle it.
       if (!isAlive()) {
-        console.warn(
-          '[AMI Parts Bridge] Extension was reloaded. Refresh this CRM tab, then click Order from O\'Reilly again.'
-        );
+        detach();
         return;
       }
 
@@ -91,16 +112,16 @@
       }).then((response) => {
         try {
           if (response?.ok === false && response.error) {
-            console.warn('[AMI Parts Bridge]', response.error);
+            if (/reloaded|invalidated/i.test(response.error)) detach();
             return;
           }
           void safeSend({ type: 'AMI_SHOW_WIDGET' });
         } catch (_error) {
-          // ignore
+          detach();
         }
       });
     } catch (_error) {
-      // Swallow — stale content script after extension reload.
+      detach();
     }
   }
 
@@ -110,8 +131,10 @@
   try {
     if (isAlive()) {
       window.dispatchEvent(new CustomEvent(PONG));
+    } else {
+      detach();
     }
   } catch (_error) {
-    // ignore
+    detach();
   }
 })();

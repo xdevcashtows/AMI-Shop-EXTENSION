@@ -155,10 +155,28 @@ function render() {
     tr.innerHTML = `
       <td class="mono">${escapeHtml(line.partNumber || '—')}</td>
       <td>${escapeHtml(line.description || '')}</td>
-      <td>${escapeHtml(String(line.quantity ?? 1))}</td>
+      <td class="qty-cell"></td>
       <td>${money(line.cost)}</td>
       <td></td>
     `;
+
+    const qtyInput = document.createElement('input');
+    qtyInput.type = 'number';
+    qtyInput.className = 'qty-input';
+    qtyInput.min = '1';
+    qtyInput.step = '1';
+    qtyInput.value = String(Math.max(1, Number(line.quantity) || 1));
+    qtyInput.title = 'Edit quantity';
+    qtyInput.setAttribute('aria-label', `Quantity for ${line.partNumber || 'part'}`);
+    qtyInput.addEventListener('change', () => void updateQuantity(index, qtyInput.value));
+    qtyInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        qtyInput.blur();
+      }
+    });
+    tr.querySelector('.qty-cell')?.appendChild(qtyInput);
+
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
     removeBtn.className = 'btn danger-text';
@@ -184,10 +202,7 @@ async function load() {
   render();
 }
 
-async function removeLine(index) {
-  if (!currentSession) return;
-  const lines = [...(currentSession.lines || [])];
-  lines.splice(index, 1);
+async function persistLines(lines, statusText) {
   const response = await sendMessage({
     type: 'AMI_UPDATE_CART',
     lines,
@@ -195,15 +210,40 @@ async function removeLine(index) {
   });
   if (response?.error) {
     setStatus(response.error, 'err');
-    return;
+    return false;
   }
   if (response?.session) {
     currentSession = response.session;
-  } else {
+  } else if (currentSession) {
     currentSession = { ...currentSession, lines };
   }
-  setStatus(lines.length ? 'Part removed from shop cart' : 'Shop cart cleared', 'ok');
+  if (statusText) setStatus(statusText, 'ok');
   render();
+  return true;
+}
+
+async function updateQuantity(index, rawValue) {
+  if (!currentSession) return;
+  const qty = Math.max(1, Math.floor(Number(rawValue)) || 1);
+  const lines = (currentSession.lines || []).map((line, i) =>
+    i === index ? { ...line, quantity: qty } : line
+  );
+  const prev = Math.max(1, Number(currentSession.lines?.[index]?.quantity) || 1);
+  if (qty === prev) {
+    render();
+    return;
+  }
+  await persistLines(lines, `Quantity updated to ${qty}`);
+}
+
+async function removeLine(index) {
+  if (!currentSession) return;
+  const lines = [...(currentSession.lines || [])];
+  lines.splice(index, 1);
+  await persistLines(
+    lines,
+    lines.length ? 'Part removed from shop cart' : 'Shop cart cleared'
+  );
 }
 
 function postToParent(type, payload) {

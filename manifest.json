@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.2.11",
+  "version": "0.2.13",
   "description": "Floating widget that mirrors NAPA / O'Reilly quote carts and transfers parts into AMI Shop CRM job cards.",
   "permissions": ["storage", "tabs"],
   "host_permissions": [

@@ -226,6 +226,33 @@ th {
   text-transform: uppercase;
 }
 
+.qty-cell {
+  width: 52px;
+}
+
+.qty-input {
+  width: 48px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--navy);
+  background: #fff;
+  text-align: center;
+}
+
+.qty-input:focus {
+  outline: none;
+  border-color: #94a3b8;
+  box-shadow: 0 0 0 2px rgba(15, 39, 68, 0.12);
+}
+
+.qty-input::-webkit-outer-spin-button,
+.qty-input::-webkit-inner-spin-button {
+  opacity: 1;
+}
+
 .footer {
   display: flex;
   gap: 8px;
