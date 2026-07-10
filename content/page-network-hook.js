@@ -4,6 +4,7 @@
 
   const SOURCE = 'ami-parts-bridge-network';
   const FETCH_SOURCE = 'ami-parts-bridge-fetch-miniquote';
+  const NAPA_FETCH_SOURCE = 'ami-parts-bridge-fetch-napa-minicart';
 
   function emit(url, body, kind, method) {
     try {
@@ -96,28 +97,62 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || data.source !== FETCH_SOURCE) return;
-    const worksheetId = String(data.worksheetId || '').trim();
-    if (!/^\d+$/.test(worksheetId)) {
-      emit('', JSON.stringify({ error: 'missing worksheet id' }), 'response', 'GET');
+    if (!data) return;
+
+    if (data.source === FETCH_SOURCE) {
+      const worksheetId = String(data.worksheetId || '').trim();
+      if (!/^\d+$/.test(worksheetId)) {
+        emit('', JSON.stringify({ error: 'missing worksheet id' }), 'response', 'GET');
+        return;
+      }
+      const url = `/FirstCallOnline/worksheet/rest/v2/miniquote/${worksheetId}`;
+      const headers = {
+        Accept: 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest'
+      };
+      const token = csrfToken() || lastCsrfFromHeader;
+      if (token) headers['x-csrf-token'] = token;
+
+      fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
+        .then((response) => response.text().then((text) => ({ response, text })))
+        .then(({ response, text }) => {
+          emit(response.url || url, text, 'response', 'GET');
+        })
+        .catch(() => {
+          emit(url, JSON.stringify({ quoteDetails: [], totalItems: 0 }), 'response', 'GET');
+        });
       return;
     }
-    const url = `/FirstCallOnline/worksheet/rest/v2/miniquote/${worksheetId}`;
-    const headers = {
-      Accept: 'application/json, text/plain, */*',
-      'X-Requested-With': 'XMLHttpRequest'
-    };
-    const token = csrfToken() || lastCsrfFromHeader;
-    if (token) headers['x-csrf-token'] = token;
 
-    fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
-      .then((response) => response.text().then((text) => ({ response, text })))
-      .then(({ response, text }) => {
-        emit(response.url || url, text, 'response', 'GET');
-      })
-      .catch(() => {
-        emit(url, JSON.stringify({ quoteDetails: [], totalItems: 0 }), 'response', 'GET');
-      });
+    if (data.source === NAPA_FETCH_SOURCE) {
+      const cartCode = String(data.cartCode || '').trim();
+      if (!cartCode) {
+        emit('', JSON.stringify({ error: 'missing cart code' }), 'response', 'GET');
+        return;
+      }
+      const params = new URLSearchParams({ fields: 'DEFAULT' });
+      const sponsorPk = String(data.sponsorPk || '').trim();
+      if (sponsorPk) params.set('sponsorPK', sponsorPk);
+      const url = `/occ/v2/prolinkus/users/current/carts/${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
+      const headers = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
+      };
+
+      fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
+        .then((response) => response.text().then((text) => ({ response, text })))
+        .then(({ response, text }) => {
+          emit(response.url || url, text, 'response', 'GET');
+        })
+        .catch(() => {
+          emit(
+            url,
+            JSON.stringify({ code: cartCode, entries: [], totalItems: 0 }),
+            'response',
+            'GET'
+          );
+        });
+    }
   });
 
   const origFetch = window.fetch;

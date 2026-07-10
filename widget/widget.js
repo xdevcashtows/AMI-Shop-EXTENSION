@@ -16,7 +16,7 @@ function sendMessage(message) {
     if (!extensionAlive()) {
       resolve({
         ok: false,
-        error: 'Extension was reloaded — refresh this FirstCall tab'
+        error: 'Extension was reloaded — refresh this supplier tab'
       });
       return;
     }
@@ -27,7 +27,7 @@ function sendMessage(message) {
           resolve({
             ok: false,
             error: /invalidated/i.test(err.message || '')
-              ? 'Extension was reloaded — refresh this FirstCall tab'
+              ? 'Extension was reloaded — refresh this supplier tab'
               : err.message
           });
           return;
@@ -40,7 +40,7 @@ function sendMessage(message) {
         error:
           error instanceof Error
             ? error.message
-            : 'Extension was reloaded — refresh this FirstCall tab'
+            : 'Extension was reloaded — refresh this supplier tab'
       });
     }
   });
@@ -141,7 +141,9 @@ function render() {
   if (!lines.length) {
     els.cartEmpty.classList.remove('hidden');
     els.cartEmpty.textContent =
-      'Shop cart is empty. Add parts to your O\'Reilly quote, then they will appear here.';
+      session.supplier === 'napa'
+        ? 'Shop cart is empty. Add parts to your NAPA ProLink cart, then they will appear here.'
+        : 'Shop cart is empty. Add parts to your O\'Reilly quote, then they will appear here.';
     els.cartTable.classList.add('hidden');
     els.cartBody.innerHTML = '';
     return;
@@ -320,7 +322,7 @@ els.toggleSettingsBtn.addEventListener('click', () => {
 
 els.saveApiBtn.addEventListener('click', () => {
   if (!extensionAlive()) {
-    setStatus('Extension was reloaded — refresh this FirstCall tab', 'err');
+    setStatus('Extension was reloaded — refresh this supplier tab', 'err');
     return;
   }
   const apiBaseUrl = els.apiBaseInput.value.trim() || DEFAULT_API_BASE;
@@ -333,7 +335,7 @@ els.saveApiBtn.addEventListener('click', () => {
       setStatus(`API base saved: ${apiBaseUrl}`, 'ok');
     });
   } catch {
-    setStatus('Extension was reloaded — refresh this FirstCall tab', 'err');
+    setStatus('Extension was reloaded — refresh this supplier tab', 'err');
   }
 });
 
@@ -351,10 +353,11 @@ els.clearBtn.addEventListener('click', async () => {
 els.transferBtn.addEventListener('click', async () => {
   if (!currentSession?.lines?.length) return;
   const count = currentSession.lines.length;
-  const ok = window.confirm(
-    `Transfer ${count} part${count === 1 ? '' : 's'} to the job card?`
-  );
-  if (!ok) return;
+  const jobLabel = currentSession.jobNumber
+    ? `#${currentSession.jobNumber}`
+    : currentSession.jobCardId
+      ? `#${String(currentSession.jobCardId).slice(0, 8)}…`
+      : null;
 
   setStatus('Transferring…');
   const response = await sendMessage({
@@ -365,7 +368,11 @@ els.transferBtn.addEventListener('click', async () => {
     setStatus(response?.error || 'Transfer failed', 'err');
     return;
   }
-  setStatus('Transferred — return to AMI to import', 'ok');
+  const jobSuffix = jobLabel ? ` to job card ${jobLabel}` : ' to the job card';
+  setStatus(
+    `Transferred ${count} part${count === 1 ? '' : 's'}${jobSuffix}`,
+    'ok'
+  );
 });
 
 try {

@@ -89,8 +89,8 @@
       const detail = event?.detail;
       if (!detail || !detail.sessionId || !detail.bridgeToken) return;
 
-      // Session is also passed via the FirstCall launch URL hash, so a dead
-      // CRM bridge is non-fatal — detach quietly and let the O'Reilly tab handle it.
+      // Session is also passed via the supplier launch URL hash, so a dead
+      // CRM bridge is non-fatal — detach quietly and let the supplier tab handle it.
       if (!isAlive()) {
         detach();
         return;

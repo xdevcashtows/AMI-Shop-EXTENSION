@@ -21,19 +21,28 @@ function isOreillyUrl(url) {
   );
 }
 
-function showWidgetOnOreillyTabs() {
+function isNapaUrl(url) {
+  if (!url) return false;
+  return url.includes('napaprolink.com');
+}
+
+function isSupplierUrl(url) {
+  return isOreillyUrl(url) || isNapaUrl(url);
+}
+
+function showWidgetOnSupplierTabs() {
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
       if (!tab.id || !tab.url) continue;
-      if (isOreillyUrl(tab.url)) showWidgetOnTab(tab.id);
+      if (isSupplierUrl(tab.url)) showWidgetOnTab(tab.id);
     }
   });
 }
 
 chrome.action.onClicked.addListener((tab) => {
   if (tab?.id == null) return;
-  if (!isOreillyUrl(tab.url || '')) {
-    // Widget only lives on O'Reilly / FirstCall pages.
+  if (!isSupplierUrl(tab.url || '')) {
+    // Widget only lives on O'Reilly / FirstCall / NAPA ProLink pages.
     return;
   }
   chrome.tabs.sendMessage(tab.id, { type: 'AMI_TOGGLE_WIDGET' }, () => {
@@ -74,7 +83,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const sameSession =
           previous && previous.sessionId && previous.sessionId === session.sessionId;
 
-        // Fresh Order from O'Reilly / new session always starts with an empty shop cart.
+        // Fresh Order from supplier / new session always starts with an empty shop cart.
         // Only keep lines if this is an explicit update to the same sessionId with lines provided.
         const lines = incomingLines.length
           ? incomingLines
@@ -91,15 +100,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.local.set(
           {
             [STORAGE_KEYS.session]: next,
-            // Never carry pending scrapes into a newly opened FirstCall session.
+            // Never carry pending scrapes into a newly opened supplier session.
             [STORAGE_KEYS.pendingLines]: sameSession ? pending : []
           },
           () => {
-            showWidgetOnOreillyTabs();
-            // Also push session to open O'Reilly tabs explicitly.
+            showWidgetOnSupplierTabs();
+            // Also push session to open supplier tabs explicitly.
             chrome.tabs.query({}, (tabs) => {
               for (const tab of tabs) {
-                if (!tab.id || !isOreillyUrl(tab.url || '')) continue;
+                if (!tab.id || !isSupplierUrl(tab.url || '')) continue;
                 chrome.tabs.sendMessage(
                   tab.id,
                   {
@@ -228,12 +237,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'AMI_SHOW_WIDGET') {
-    showWidgetOnOreillyTabs();
+    showWidgetOnSupplierTabs();
     sendResponse({ ok: true });
     return;
   }
 
-  // Widget Refresh → content script re-fetches FirstCall miniquote.
+  // Widget Refresh → content script re-fetches supplier cart snapshot.
   if (message.type === 'AMI_SCRAPE_NOW') {
     const tabId = sender.tab?.id;
     if (tabId == null) {
