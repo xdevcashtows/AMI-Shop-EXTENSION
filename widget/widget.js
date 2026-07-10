@@ -368,6 +368,12 @@ els.transferBtn.addEventListener('click', async () => {
     setStatus(response?.error || 'Transfer failed', 'err');
     return;
   }
+  if (response?.session) {
+    currentSession = response.session;
+  } else if (currentSession) {
+    currentSession = { ...currentSession, lines: [] };
+  }
+  render();
   const jobSuffix = jobLabel ? ` to job card ${jobLabel}` : ' to the job card';
   setStatus(
     `Transferred ${count} part${count === 1 ? '' : 's'}${jobSuffix}`,

@@ -225,7 +225,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        sendResponse({ ok: true, payload });
+        const cleared = {
+          ...session,
+          lines: [],
+          updatedAt: new Date().toISOString()
+        };
+        chrome.storage.local.set({ [STORAGE_KEYS.session]: cleared }, () => {
+          sendResponse({ ok: true, payload, session: cleared });
+        });
       } catch (error) {
         sendResponse({
           ok: false,

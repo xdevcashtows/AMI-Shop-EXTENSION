@@ -72,13 +72,29 @@
     });
   }
 
+  function getExtensionVersion() {
+    try {
+      return String(chrome.runtime.getManifest()?.version || '').trim() || null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function dispatchPong() {
+    window.dispatchEvent(
+      new CustomEvent(PONG, {
+        detail: { version: getExtensionVersion() }
+      })
+    );
+  }
+
   function onPing() {
     try {
       if (!isAlive()) {
         detach();
         return;
       }
-      window.dispatchEvent(new CustomEvent(PONG));
+      dispatchPong();
     } catch (_error) {
       detach();
     }
@@ -130,7 +146,7 @@
 
   try {
     if (isAlive()) {
-      window.dispatchEvent(new CustomEvent(PONG));
+      dispatchPong();
     } else {
       detach();
     }
