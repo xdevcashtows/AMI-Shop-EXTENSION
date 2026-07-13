@@ -10,6 +10,8 @@
   let lastCartCode = '';
   /** @type {string} */
   let lastSponsorPk = '';
+  /** Timestamp of last successful ATC merge — used to ignore stale mini-cart snapshots. */
+  let lastAtcAt = 0;
   let dead = false;
 
   function markDead() {
@@ -213,17 +215,23 @@
 
     if (data?.code) rememberCartCode(data.code);
 
-    // Authoritative mini-cart snapshot (including empty).
-    if (Array.isArray(data?.entries)) {
-      data.entries.forEach((entry) => push(entry));
-      return Array.from(map.values());
-    }
-
-    // Add-to-cart response
-    if (Array.isArray(data?.cartModifications)) {
+    // ATC responses expose cartModifications; prefer those so a partial
+    // `entries` array on the same payload cannot hide the added line.
+    if (Array.isArray(data?.cartModifications) && data.cartModifications.length) {
       data.cartModifications.forEach((mod) => {
         if (mod?.entry) push(mod.entry);
       });
+      // Some ATC payloads also include a fuller entries snapshot.
+      if (Array.isArray(data?.entries) && data.entries.length > map.size) {
+        map.clear();
+        data.entries.forEach((entry) => push(entry));
+      }
+      return Array.from(map.values());
+    }
+
+    // Mini-cart / full cart snapshot.
+    if (Array.isArray(data?.entries)) {
+      data.entries.forEach((entry) => push(entry));
       return Array.from(map.values());
     }
 
@@ -421,9 +429,25 @@
 
     if (data?.code) rememberCartCode(data.code);
 
-    // getMiniCart is authoritative, including empty carts after removals.
-    if (isNapaMiniCartUrl(sourceHint) || Array.isArray(data?.entries)) {
-      applyCartLines(extractNapaCartLines(data), { replace: true });
+    // getMiniCart is the only authoritative full-cart replace (incl. empty after removals).
+    // Do NOT treat every payload with `entries` as a full snapshot — ProLink ATC /
+    // entry-mutation responses often include a partial `entries` array, which used
+    // to wipe the extension cart down to a single line.
+    if (isNapaMiniCartUrl(sourceHint)) {
+      const lines = extractNapaCartLines(data);
+      // Ignore stale mini-cart responses that arrive after a newer ATC merge and
+      // would shrink the cart (common race when multiple refreshes are in flight).
+      const msSinceAtc = Date.now() - lastAtcAt;
+      if (
+        lastAtcAt > 0 &&
+        msSinceAtc < 2000 &&
+        lines.length > 0 &&
+        lines.length < networkLines.length
+      ) {
+        window.setTimeout(() => requestMiniCartRefresh(), 400);
+        return;
+      }
+      applyCartLines(lines, { replace: true });
       return;
     }
 
@@ -432,16 +456,41 @@
       const lines = extractNapaCartLines(data);
       if (lines.length) {
         applyCartLines(lines, { replace: false });
+        lastAtcAt = Date.now();
       }
       window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
     }
 
     // Quantity update / remove (product=…&quantity=0) — refresh mini-cart.
+    // Do not apply partial `entries` from these responses as a full replace.
     if (isNapaEntriesMutationUrl(sourceHint)) {
       window.setTimeout(() => requestMiniCartRefresh(), 250);
       window.setTimeout(() => requestMiniCartRefresh(), 900);
       return;
+    }
+
+    // Other cart payloads with entries (e.g. non-miniCart cart GETs):
+    // only replace when the snapshot is at least as complete as what we have;
+    // otherwise merge and refresh so partial responses cannot shrink the cart.
+    if (Array.isArray(data?.entries)) {
+      const lines = extractNapaCartLines(data);
+      const totalHint =
+        Number(data.totalItems) ||
+        Number(data.totalUnitCount) ||
+        Number(data.deliveryItemsQuantity) ||
+        0;
+      const looksComplete =
+        lines.length >= networkLines.length ||
+        (totalHint > 0 && lines.length >= totalHint) ||
+        (lines.length === 0 && totalHint === 0 && Array.isArray(data.entries));
+
+      if (looksComplete) {
+        applyCartLines(lines, { replace: true });
+      } else if (lines.length) {
+        applyCartLines(lines, { replace: false });
+      }
+      window.setTimeout(() => requestMiniCartRefresh(), 250);
     }
   }
 
