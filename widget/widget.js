@@ -1,5 +1,3 @@
-const DEFAULT_API_BASE = 'http://localhost:8787';
-
 /** @type {any} */
 let currentSession = null;
 
@@ -54,15 +52,10 @@ const els = {
   vehicleLabel: document.getElementById('vehicleLabel'),
   copyVinBtn: document.getElementById('copyVinBtn'),
   fillVinBtn: document.getElementById('fillVinBtn'),
-  refreshBtn: document.getElementById('refreshBtn'),
-  addTestBtn: document.getElementById('addTestBtn'),
   cartEmpty: document.getElementById('cartEmpty'),
+  cartCount: document.getElementById('cartCount'),
   cartTable: document.getElementById('cartTable'),
   cartBody: document.getElementById('cartBody'),
-  apiBaseInput: document.getElementById('apiBaseInput'),
-  saveApiBtn: document.getElementById('saveApiBtn'),
-  toggleSettingsBtn: document.getElementById('toggleSettingsBtn'),
-  settingsBody: document.getElementById('settingsBody'),
   status: document.getElementById('status'),
   clearBtn: document.getElementById('clearBtn'),
   transferBtn: document.getElementById('transferBtn')
@@ -104,6 +97,16 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
+function setCartCount(count) {
+  if (!els.cartCount) return;
+  if (count > 0) {
+    els.cartCount.textContent = String(count);
+    els.cartCount.classList.remove('hidden');
+  } else {
+    els.cartCount.classList.add('hidden');
+  }
+}
+
 function render() {
   const session = currentSession;
   if (!session) {
@@ -115,7 +118,12 @@ function render() {
     els.copyVinBtn.disabled = true;
     els.fillVinBtn.disabled = true;
     els.transferBtn.disabled = true;
+    setCartCount(0);
     els.cartEmpty.classList.remove('hidden');
+    els.cartEmpty.innerHTML = `
+      <span class="empty-title">No active session</span>
+      <span class="empty-hint">Start shopping from a job card in AMI Shop CRM.</span>
+    `;
     els.cartTable.classList.add('hidden');
     els.cartBody.innerHTML = '';
     return;
@@ -137,13 +145,15 @@ function render() {
 
   const lines = Array.isArray(session.lines) ? session.lines : [];
   els.transferBtn.disabled = lines.length === 0;
+  setCartCount(lines.length);
 
   if (!lines.length) {
     els.cartEmpty.classList.remove('hidden');
-    els.cartEmpty.textContent =
-      session.supplier === 'napa'
-        ? 'Shop cart is empty. Add parts to your NAPA ProLink cart, then they will appear here.'
-        : 'Shop cart is empty. Add parts to your O\'Reilly quote, then they will appear here.';
+    const supplierName = session.supplier === 'napa' ? 'NAPA ProLink' : "O'Reilly";
+    els.cartEmpty.innerHTML = `
+      <span class="empty-title">Cart is empty</span>
+      <span class="empty-hint">Add parts to your ${supplierName} cart and they’ll show up here.</span>
+    `;
     els.cartTable.classList.add('hidden');
     els.cartBody.innerHTML = '';
     return;
@@ -155,11 +165,11 @@ function render() {
   lines.forEach((line, index) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="mono">${escapeHtml(line.partNumber || '—')}</td>
-      <td>${escapeHtml(line.description || '')}</td>
-      <td class="qty-cell"></td>
-      <td>${money(line.cost)}</td>
-      <td></td>
+      <td class="part-cell">${escapeHtml(line.partNumber || '—')}</td>
+      <td class="desc-cell" title="${escapeHtml(line.description || '')}">${escapeHtml(line.description || '')}</td>
+      <td class="qty-cell num"></td>
+      <td class="cost-cell">${money(line.cost)}</td>
+      <td class="actions-col"></td>
     `;
 
     const qtyInput = document.createElement('input');
@@ -181,9 +191,10 @@ function render() {
 
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
-    removeBtn.className = 'btn danger-text';
+    removeBtn.className = 'btn icon-danger';
     removeBtn.textContent = '✕';
     removeBtn.title = 'Remove';
+    removeBtn.setAttribute('aria-label', `Remove ${line.partNumber || 'part'}`);
     removeBtn.addEventListener('click', () => void removeLine(index));
     tr.lastElementChild.appendChild(removeBtn);
     els.cartBody.appendChild(tr);
@@ -197,10 +208,6 @@ async function load() {
     return;
   }
   currentSession = response?.session || null;
-  els.apiBaseInput.value =
-    response?.settings?.apiBaseUrl ||
-    currentSession?.apiBaseUrl ||
-    DEFAULT_API_BASE;
   render();
 }
 
@@ -270,73 +277,6 @@ els.copyVinBtn.addEventListener('click', async () => {
 els.fillVinBtn.addEventListener('click', () => {
   postToParent('AMI_WIDGET_FILL_VIN');
   setStatus('Requested VIN fill on this page…');
-});
-
-els.refreshBtn.addEventListener('click', () => {
-  postToParent('AMI_WIDGET_SCRAPE_NOW');
-  setStatus('Refreshing cart…');
-  window.setTimeout(() => void load(), 600);
-  window.setTimeout(() => void load(), 1400);
-  window.setTimeout(async () => {
-    await load();
-    const count = Array.isArray(currentSession?.lines) ? currentSession.lines.length : 0;
-    setStatus(
-      count ? `Cart refreshed · ${count} part${count === 1 ? '' : 's'}` : 'Cart refreshed · empty',
-      'ok'
-    );
-  }, 2200);
-});
-
-els.addTestBtn.addEventListener('click', async () => {
-  if (!currentSession) {
-    setStatus('Start a session from AMI Shop CRM first', 'err');
-    return;
-  }
-  const lines = [
-    ...(currentSession.lines || []),
-    {
-      partNumber: 'TEST-1001',
-      description: 'Test oil filter (manual)',
-      brand: 'Test',
-      quantity: 1,
-      cost: 4.25,
-      vendor: currentSession.supplier === 'napa' ? 'NAPA' : "O'Reilly",
-      unit: 'pc.'
-    }
-  ];
-  const response = await sendMessage({ type: 'AMI_UPDATE_CART', lines });
-  if (response?.error) {
-    setStatus(response.error, 'err');
-    return;
-  }
-  if (response?.session) currentSession = response.session;
-  setStatus('Test part added — use Transfer to verify', 'ok');
-  render();
-});
-
-els.toggleSettingsBtn.addEventListener('click', () => {
-  const open = !els.settingsBody.classList.contains('hidden');
-  els.settingsBody.classList.toggle('hidden', open);
-  els.toggleSettingsBtn.textContent = open ? 'API settings ▾' : 'API settings ▴';
-});
-
-els.saveApiBtn.addEventListener('click', () => {
-  if (!extensionAlive()) {
-    setStatus('Extension was reloaded — refresh this supplier tab', 'err');
-    return;
-  }
-  const apiBaseUrl = els.apiBaseInput.value.trim() || DEFAULT_API_BASE;
-  try {
-    chrome.storage.local.set({ amiPartsBridgeSettings: { apiBaseUrl } }, () => {
-      if (chrome.runtime.lastError) {
-        setStatus(chrome.runtime.lastError.message, 'err');
-        return;
-      }
-      setStatus(`API base saved: ${apiBaseUrl}`, 'ok');
-    });
-  } catch {
-    setStatus('Extension was reloaded — refresh this supplier tab', 'err');
-  }
 });
 
 els.clearBtn.addEventListener('click', async () => {

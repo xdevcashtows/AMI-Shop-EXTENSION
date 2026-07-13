@@ -8,76 +8,72 @@
   </head>
   <body>
     <header class="header">
-      <div>
+      <div class="header-text">
         <h1>AMI Parts Bridge</h1>
         <p id="subtitle" class="muted">No active session</p>
       </div>
       <span id="supplierBadge" class="badge hidden"></span>
     </header>
 
-    <section class="card" id="sessionCard">
-      <div class="row between">
-        <div>
-          <div class="label">Job</div>
-          <div id="jobLabel" class="value">—</div>
+    <main class="content">
+      <section class="card session-card" id="sessionCard">
+        <div class="session-top">
+          <div>
+            <div class="label">Job</div>
+            <div id="jobLabel" class="value">—</div>
+          </div>
+          <div class="actions">
+            <button type="button" id="copyVinBtn" class="btn secondary" disabled>Copy VIN</button>
+            <button type="button" id="fillVinBtn" class="btn secondary" disabled>Fill VIN</button>
+          </div>
         </div>
-        <div class="actions">
-          <button type="button" id="copyVinBtn" class="btn secondary" disabled>Copy VIN</button>
-          <button type="button" id="fillVinBtn" class="btn secondary" disabled>Fill VIN</button>
+        <div class="vin-box">
+          <div class="label">Vehicle / VIN</div>
+          <div id="vehicleRow" class="vehicle-row">
+            <span id="ymmLabel" class="value">—</span>
+            <span class="vehicle-sep">·</span>
+            <span id="vehicleLabel" class="mono">—</span>
+          </div>
         </div>
-      </div>
-      <div class="vin-box">
-        <div class="label">Vehicle / VIN</div>
-        <div id="vehicleRow" class="vehicle-row">
-          <span id="ymmLabel" class="value">—</span>
-          <span class="vehicle-sep">·</span>
-          <span id="vehicleLabel" class="mono">—</span>
-        </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="card">
-      <div class="row between">
-        <h2>Shop Cart</h2>
-        <div class="actions">
-          <button type="button" id="refreshBtn" class="btn secondary">Refresh</button>
-          <button type="button" id="addTestBtn" class="btn secondary">Add test</button>
+      <section class="card cart-card">
+        <div class="cart-header">
+          <div class="cart-title-row">
+            <h2>Shop Cart</h2>
+            <span id="cartCount" class="count-pill hidden">0</span>
+          </div>
         </div>
-      </div>
-      <div id="cartEmpty" class="empty">Shop cart is empty. Add parts to your O'Reilly quote, then they will appear here.</div>
-      <div class="table-wrap">
-        <table id="cartTable" class="hidden">
-          <thead>
-            <tr>
-              <th>Part #</th>
-              <th>Description</th>
-              <th>Qty</th>
-              <th>Cost</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="cartBody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card collapsed-settings" id="settingsCard">
-      <button type="button" id="toggleSettingsBtn" class="settings-toggle">API settings ▾</button>
-      <div id="settingsBody" class="settings-body hidden">
-        <label class="label" for="apiBaseInput">API base URL</label>
-        <div class="row">
-          <input id="apiBaseInput" class="input" type="url" placeholder="http://localhost:8787" />
-          <button type="button" id="saveApiBtn" class="btn secondary">Save</button>
+        <div id="cartEmpty" class="empty">
+          <span class="empty-title">Cart is empty</span>
+          <span class="empty-hint"
+            >Add parts on the supplier site and they’ll show up here.</span
+          >
         </div>
-        <p class="hint">Extension posts transfers here (AMI API server).</p>
-      </div>
-    </section>
+        <div class="table-wrap">
+          <table id="cartTable" class="hidden">
+            <thead>
+              <tr>
+                <th>Part #</th>
+                <th>Description</th>
+                <th class="num">Qty</th>
+                <th class="num">Cost</th>
+                <th class="actions-col"></th>
+              </tr>
+            </thead>
+            <tbody id="cartBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
 
     <p id="status" class="status" role="status"></p>
 
     <footer class="footer">
       <button type="button" id="clearBtn" class="btn secondary">Clear</button>
-      <button type="button" id="transferBtn" class="btn primary" disabled>Transfer to Job Card</button>
+      <button type="button" id="transferBtn" class="btn primary" disabled>
+        Transfer to Job Card
+      </button>
     </footer>
 
     <script src="widget.js"></script>
