@@ -24,12 +24,8 @@
    * (stale 1-line mini-carts were deleting a second SKU).
    */
   let removeLineFloor = 0;
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let pendingRefreshTimer = null;
-  let refreshInFlight = false;
-  let refreshQueuedAgain = false;
-  /** Monotonic id so late/stale mini-cart responses can be ignored. */
-  let miniCartGeneration = 0;
+  /** Product code from the latest quantity=0 request (e.g. ND_4406718). */
+  let lastRemovedProductKey = '';
   let dead = false;
 
   function markDead() {
@@ -394,63 +390,12 @@
     void pushCartUpdate(true);
   }
 
-  async function fetchMiniCart(cartCode) {
-    // Prefer page-world fetch only (session + same OCC path as ProLink).
-    // Content-script fetch races with the page and can return a smaller/stale
-    // cart that then overwrites the extension Shop Cart.
-    const code = cartCode || resolveCartCode();
-    if (!code) {
-      void pushCartUpdate(true);
-      return false;
-    }
-
-    try {
-      window.postMessage(
-        {
-          source: 'ami-parts-bridge-fetch-napa-minicart',
-          cartCode: code,
-          sponsorPk: resolveSponsorPk(),
-          cartApiPrefix: lastCartApiPrefix,
-          generation: miniCartGeneration
-        },
-        '*'
-      );
-      return true;
-    } catch {
-      void pushCartUpdate(true);
-      return false;
-    }
-  }
-
   function requestMiniCartRefresh() {
-    const cartCode = resolveCartCode();
-    if (!cartCode) {
-      void pushCartUpdate(true);
-      return false;
-    }
-
-    // Coalesce the refresh storm (ATC + click + page + retries) into one call.
-    if (pendingRefreshTimer) window.clearTimeout(pendingRefreshTimer);
-    pendingRefreshTimer = window.setTimeout(() => {
-      pendingRefreshTimer = null;
-      if (refreshInFlight) {
-        refreshQueuedAgain = true;
-        return;
-      }
-      refreshInFlight = true;
-      refreshQueuedAgain = false;
-      miniCartGeneration += 1;
-      void fetchMiniCart(resolveCartCode()).finally(() => {
-        window.setTimeout(() => {
-          refreshInFlight = false;
-          if (refreshQueuedAgain) {
-            refreshQueuedAgain = false;
-            requestMiniCartRefresh();
-          }
-        }, 700);
-      });
-    }, 400);
-    return true;
+    // ProLink already calls getMiniCart after ATC/remove. Our own refreshes
+    // often 404 (missing page auth headers) and race the real snapshot — so
+    // only rely on intercepted page traffic. Manual scrape still pushes state.
+    void pushCartUpdate(true);
+    return Boolean(resolveCartCode());
   }
 
   function entryCountHint(data, lines) {
@@ -463,18 +408,40 @@
     return lines.length;
   }
 
+  function lineMatchesProductKey(line, productKey) {
+    const key = String(productKey || '').toUpperCase();
+    if (!key || !line) return false;
+    const partFromKey = key.includes('_') ? key.split('_').slice(1).join('_') : key;
+    const externalId = String(line.externalId || '').toUpperCase();
+    const partNumber = String(line.partNumber || '').toUpperCase();
+    if (externalId && externalId === key) return true;
+    // Delete URL uses ND_4406718 while the line may only store partNumber 4406718
+    // or a different prefix (NAP_4406718) — match on the part suffix.
+    if (partFromKey && partNumber === partFromKey) return true;
+    if (partFromKey && externalId === partFromKey) return true;
+    if (partFromKey && externalId.endsWith(`_${partFromKey}`)) return true;
+    return false;
+  }
+
   function shouldAllowMiniCartShrink(lines, _data) {
     // Empty clears are handled separately with stricter 200-OK checks.
     if (lines.length === 0) return false;
-    // After a fresh ATC, never shrink — a stale 1-line mini-cart was wiping
-    // the just-merged second item (especially after remove → re-add).
-    if (Date.now() - lastAtcAt < 8000) return false;
-    // After surgical remove, never drop below the remaining local count.
-    if (removeLineFloor > 0 && lines.length < removeLineFloor) return false;
-    // If surgical remove missed, allow exactly one line to disappear.
-    if (Date.now() - lastRemoveAt < 8000 && removeLineFloor === 0) {
-      return lines.length >= networkLines.length - 1;
+
+    // Explicit remove always beats a recent ATC window. Otherwise the first
+    // added line could not be deleted within 8s of another add.
+    if (Date.now() - lastRemoveAt < 8000) {
+      if (
+        lastRemovedProductKey &&
+        !lines.some((line) => lineMatchesProductKey(line, lastRemovedProductKey))
+      ) {
+        // Page mini-cart no longer has the deleted SKU — trust it.
+        return true;
+      }
+      if (removeLineFloor > 0 && lines.length < removeLineFloor) return false;
+      return true;
     }
+
+    if (Date.now() - lastAtcAt < 8000) return false;
     return false;
   }
 
@@ -506,24 +473,10 @@
 
   function removeLocalLineByProductKey(productKey) {
     if (!productKey) return false;
-    const key = String(productKey).toUpperCase();
-    const partFromKey = key.includes('_') ? key.split('_').slice(1).join('_') : key;
     const before = networkLines.length;
-    networkLines = networkLines.filter((line) => {
-      const externalId = String(line.externalId || '').toUpperCase();
-      const partNumber = String(line.partNumber || '').toUpperCase();
-      // Prefer exact product code match (e.g. UP_370200).
-      if (externalId && externalId === key) return false;
-      // Fallback: same part number only when externalId uses the same code prefix.
-      if (
-        partFromKey &&
-        partNumber === partFromKey &&
-        (!externalId || externalId === key || externalId.endsWith(`_${partFromKey}`))
-      ) {
-        return false;
-      }
-      return true;
-    });
+    networkLines = networkLines.filter(
+      (line) => !lineMatchesProductKey(line, productKey)
+    );
     if (networkLines.length !== before) {
       void pushCartUpdate(true);
       return true;
@@ -569,16 +522,6 @@
 
     if (data?.code) rememberCartCode(data.code);
 
-    // Ignore stale page-world refresh responses when a newer refresh was queued.
-    const responseGen = Number(meta?.generation);
-    if (
-      Number.isFinite(responseGen) &&
-      responseGen > 0 &&
-      responseGen < miniCartGeneration
-    ) {
-      return;
-    }
-
     // getMiniCart is the only authoritative full-cart replace (incl. empty after removals).
     // Do NOT treat every payload with `entries` as a full snapshot — ProLink ATC /
     // entry-mutation responses often include a partial `entries` array, which used
@@ -597,13 +540,13 @@
         lines.length < networkLines.length &&
         !shouldAllowMiniCartShrink(lines, data)
       ) {
-        if (Date.now() - lastAtcAt < 5000) {
-          window.setTimeout(() => requestMiniCartRefresh(), 600);
-        }
         return;
       }
       if (removeLineFloor > 0 && lines.length >= removeLineFloor) {
         removeLineFloor = 0;
+      }
+      if (Date.now() - lastRemoveAt < 8000) {
+        lastRemovedProductKey = '';
       }
       applyCartLines(lines, { replace: true });
       return;
@@ -623,16 +566,17 @@
         const productKey =
           productKeyFromUrl(sourceHint) ||
           String(data?.entry?.product?.code || data?.entry?.partNumber || '').toUpperCase();
+        lastRemovedProductKey = productKey;
         if (removeLocalLineByProductKey(productKey)) {
           removeLineFloor = networkLines.length;
         } else {
           removeLineFloor = 0;
         }
-        window.setTimeout(() => requestMiniCartRefresh(), 250);
+        // Page will fire getMiniCart; do not issue our own (often 404) refresh.
         return;
       }
 
-      // Non-zero quantity updates: merge changed line(s) if present, then refresh.
+      // Non-zero quantity updates: merge changed line(s) if present.
       const lines = extractNapaCartLines(data);
       if (lines.length) {
         applyCartLines(lines, { replace: false });
@@ -640,11 +584,10 @@
         const line = normalizeEntry(data.entry);
         if (line) applyCartLines([line], { replace: false });
       }
-      window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
     }
 
-    // ATC: merge added lines, then refresh mini-cart for full snapshot.
+    // ATC: merge added lines. Page getMiniCart supplies the full snapshot next.
     if (
       isNapaAtcUrl(sourceHint) ||
       (Array.isArray(data?.cartModifications) && data.cartModifications.length)
@@ -653,18 +596,16 @@
       if (lines.length) {
         applyCartLines(lines, { replace: false });
         lastAtcAt = Date.now();
-        // Close the post-remove shrink window so a stale mini-cart cannot
-        // undo this merge (ATC only returns the newly added line).
         lastRemoveAt = 0;
         removeLineFloor = 0;
+        lastRemovedProductKey = '';
       }
-      window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
     }
 
     // Other cart payloads with entries (e.g. non-miniCart cart GETs):
     // only replace when the snapshot is at least as complete as what we have;
-    // otherwise merge and refresh so partial responses cannot shrink the cart.
+    // otherwise merge so partial responses cannot shrink the cart.
     if (Array.isArray(data?.entries) || Array.isArray(data?.cart?.entries)) {
       const lines = extractNapaCartLines(data);
       const totalHint = entryCountHint(data, lines);
@@ -678,7 +619,6 @@
       } else if (lines.length) {
         applyCartLines(lines, { replace: false });
       }
-      window.setTimeout(() => requestMiniCartRefresh(), 250);
     }
   }
 
@@ -724,6 +664,7 @@
     lastSentSignature = '';
     lastRemoveAt = Date.now();
     removeLineFloor = 0;
+    lastRemovedProductKey = '';
     void pushCartUpdate(true);
   }
 
