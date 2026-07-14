@@ -15,17 +15,10 @@
    * ProLink uses orgUsers (not users) — wrong prefix causes getMiniCart 404s.
    */
   let lastCartApiPrefix = '/occ/v2/prolinkus/orgUsers/current/carts/';
-  /** Timestamp of last successful ATC merge. */
-  let lastAtcAt = 0;
-  /** Timestamp of last remove/clear intent (allows mini-cart to shrink). */
-  let lastRemoveAt = 0;
-  /**
-   * After a surgical remove, refuse getMiniCart snapshots below this line count
-   * (stale 1-line mini-carts were deleting a second SKU).
-   */
-  let removeLineFloor = 0;
-  /** Product code from the latest quantity=0 request (e.g. ND_4406718). */
-  let lastRemovedProductKey = '';
+  /** @type {{ data: any, status: number } | null} */
+  let pendingMiniCart = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let pendingMiniCartTimer = null;
   let dead = false;
 
   function markDead() {
@@ -214,8 +207,39 @@
     };
   }
 
-  /** Parse ProLink ATC / getMiniCart payloads into cart lines. */
-  function extractNapaCartLines(data) {
+  /** Parse ATC cartModifications (partial — one added line). */
+  function extractAtcLines(data) {
+    /** @type {Map<string, any>} */
+    const map = new Map();
+
+    function push(raw) {
+      const line = normalizeEntry(raw);
+      if (!line) return;
+      const key = (
+        line.externalId ||
+        line.partNumber ||
+        line.description ||
+        ''
+      ).toUpperCase();
+      if (!key) return;
+      map.set(key, line);
+    }
+
+    if (data?.code) rememberCartCode(data.code);
+    if (Array.isArray(data?.cartModifications)) {
+      data.cartModifications.forEach((mod) => {
+        if (mod?.entry) push(mod.entry);
+      });
+    }
+    return Array.from(map.values());
+  }
+
+  /**
+   * Parse getMiniCart / full cart snapshots from `entries` only.
+   * Never use cartModifications here — those are partial ATC leftovers and
+   * were collapsing a 3-line mini-cart down to 1 line.
+   */
+  function extractMiniCartLines(data) {
     /** @type {Map<string, any>} */
     const map = new Map();
 
@@ -243,39 +267,16 @@
     }
 
     if (data?.code) rememberCartCode(data.code);
-
-    // Nested full cart on some ATC / mutation payloads.
     const nestedCart =
       data?.cart && typeof data.cart === 'object' ? data.cart : null;
     if (nestedCart?.code) rememberCartCode(nestedCart.code);
 
-    // ATC responses expose cartModifications; prefer those so a partial
-    // `entries` array on the same payload cannot hide the added line.
-    if (Array.isArray(data?.cartModifications) && data.cartModifications.length) {
-      data.cartModifications.forEach((mod) => {
-        if (mod?.entry) push(mod.entry);
-      });
-      const entries =
-        (Array.isArray(data?.entries) && data.entries) ||
-        (Array.isArray(nestedCart?.entries) && nestedCart.entries) ||
-        null;
-      if (entries && entries.length > map.size) {
-        map.clear();
-        entries.forEach((entry) => push(entry));
-      }
-      return Array.from(map.values());
-    }
-
-    // Mini-cart / full cart snapshot.
     const entries =
       (Array.isArray(data?.entries) && data.entries) ||
       (Array.isArray(nestedCart?.entries) && nestedCart.entries) ||
       null;
-    if (entries) {
-      entries.forEach((entry) => push(entry));
-      return Array.from(map.values());
-    }
-
+    if (!entries) return null;
+    entries.forEach((entry) => push(entry));
     return Array.from(map.values());
   }
 
@@ -392,20 +393,9 @@
 
   function requestMiniCartRefresh() {
     // ProLink already calls getMiniCart after ATC/remove. Our own refreshes
-    // often 404 (missing page auth headers) and race the real snapshot — so
-    // only rely on intercepted page traffic. Manual scrape still pushes state.
+    // often 404 — only rely on intercepted page traffic.
     void pushCartUpdate(true);
     return Boolean(resolveCartCode());
-  }
-
-  function entryCountHint(data, lines) {
-    const totalHint =
-      Number(data?.totalItems) ||
-      Number(data?.totalUnitCount) ||
-      Number(data?.deliveryItemsQuantity) ||
-      0;
-    if (totalHint > 0) return Math.max(lines.length, totalHint);
-    return lines.length;
   }
 
   function lineMatchesProductKey(line, productKey) {
@@ -415,50 +405,10 @@
     const externalId = String(line.externalId || '').toUpperCase();
     const partNumber = String(line.partNumber || '').toUpperCase();
     if (externalId && externalId === key) return true;
-    // Delete URL uses ND_4406718 while the line may only store partNumber 4406718
-    // or a different prefix (NAP_4406718) — match on the part suffix.
     if (partFromKey && partNumber === partFromKey) return true;
     if (partFromKey && externalId === partFromKey) return true;
     if (partFromKey && externalId.endsWith(`_${partFromKey}`)) return true;
     return false;
-  }
-
-  function shouldAllowMiniCartShrink(lines, _data) {
-    // Empty clears are handled separately with stricter 200-OK checks.
-    if (lines.length === 0) return false;
-
-    // Explicit remove always beats a recent ATC window. Otherwise the first
-    // added line could not be deleted within 8s of another add.
-    if (Date.now() - lastRemoveAt < 8000) {
-      if (
-        lastRemovedProductKey &&
-        !lines.some((line) => lineMatchesProductKey(line, lastRemovedProductKey))
-      ) {
-        // Page mini-cart no longer has the deleted SKU — trust it.
-        return true;
-      }
-      if (removeLineFloor > 0 && lines.length < removeLineFloor) return false;
-      return true;
-    }
-
-    if (Date.now() - lastAtcAt < 8000) return false;
-    return false;
-  }
-
-  function isAuthoritativeEmptyCart(data, status) {
-    if (Number.isFinite(status) && status !== 200) return false;
-    if (!data || typeof data !== 'object') return false;
-    if (data.error || Array.isArray(data.errors)) return false;
-    const total =
-      Number(data.totalItems) ||
-      Number(data.totalUnitCount) ||
-      Number(data.deliveryItemsQuantity);
-    if (total > 0) return false;
-    if (Array.isArray(data.entries) && data.entries.length === 0) return true;
-    if (Array.isArray(data.cart?.entries) && data.cart.entries.length === 0) {
-      return true;
-    }
-    return total === 0 && Boolean(data.code);
   }
 
   function productKeyFromUrl(sourceHint) {
@@ -484,6 +434,32 @@
     return false;
   }
 
+  /** Authoritative sync: whatever getMiniCart says is the Shop Cart. */
+  function applyMiniCartSnapshot(data, status) {
+    if (Number.isFinite(status) && status >= 400) return;
+    if (!data || typeof data !== 'object') return;
+    if (data.error || Array.isArray(data.errors)) return;
+
+    const lines = extractMiniCartLines(data);
+    if (lines == null) return;
+    applyCartLines(lines, { replace: true });
+  }
+
+  /**
+   * Coalesce burst getMiniCart responses; apply only the latest after a short
+   * delay so an older smaller snapshot cannot win a race.
+   */
+  function queueMiniCartSnapshot(data, status) {
+    pendingMiniCart = { data, status: Number(status) || 200 };
+    if (pendingMiniCartTimer) window.clearTimeout(pendingMiniCartTimer);
+    pendingMiniCartTimer = window.setTimeout(() => {
+      pendingMiniCartTimer = null;
+      const snap = pendingMiniCart;
+      pendingMiniCart = null;
+      if (snap) applyMiniCartSnapshot(snap.data, snap.status);
+    }, 120);
+  }
+
   function ingestPayload(payload, sourceHint, kind, method, meta) {
     if (payload == null) return;
     if (kind === 'request') {
@@ -496,7 +472,6 @@
     rememberCartApiFromUrl(sourceHint);
 
     const status = Number(meta?.status);
-    // 404/5xx getMiniCart bodies were being parsed as empty carts and wiping Shop Cart.
     if (Number.isFinite(status) && status >= 400) {
       return;
     }
@@ -522,39 +497,13 @@
 
     if (data?.code) rememberCartCode(data.code);
 
-    // getMiniCart is the only authoritative full-cart replace (incl. empty after removals).
-    // Do NOT treat every payload with `entries` as a full snapshot — ProLink ATC /
-    // entry-mutation responses often include a partial `entries` array, which used
-    // to wipe the extension cart down to a single line.
+    // getMiniCart = source of truth. Always full-replace from `entries`.
     if (isNapaMiniCartUrl(sourceHint)) {
-      const lines = extractNapaCartLines(data);
-
-      if (lines.length === 0) {
-        if (!isAuthoritativeEmptyCart(data, status)) return;
-        removeLineFloor = 0;
-        applyCartLines([], { replace: true });
-        return;
-      }
-
-      if (
-        lines.length < networkLines.length &&
-        !shouldAllowMiniCartShrink(lines, data)
-      ) {
-        return;
-      }
-      if (removeLineFloor > 0 && lines.length >= removeLineFloor) {
-        removeLineFloor = 0;
-      }
-      if (Date.now() - lastRemoveAt < 8000) {
-        lastRemovedProductKey = '';
-      }
-      applyCartLines(lines, { replace: true });
+      queueMiniCartSnapshot(data, status);
       return;
     }
 
-    // Quantity update / remove (product=…&quantity=0).
-    // ProLink's remove body is ONLY the removed line (singular `entry`), not the
-    // remaining cart — never replace Shop Cart from that payload.
+    // Remove: optimistic local drop; getMiniCart will confirm full state.
     if (isNapaEntriesMutationUrl(sourceHint)) {
       const isRemove =
         /[?&]quantity=0(?:&|$)/i.test(String(sourceHint || '')) ||
@@ -562,63 +511,29 @@
         Number(data?.quantityAdded) < 0;
 
       if (isRemove) {
-        lastRemoveAt = Date.now();
         const productKey =
           productKeyFromUrl(sourceHint) ||
           String(data?.entry?.product?.code || data?.entry?.partNumber || '').toUpperCase();
-        lastRemovedProductKey = productKey;
-        if (removeLocalLineByProductKey(productKey)) {
-          removeLineFloor = networkLines.length;
-        } else {
-          removeLineFloor = 0;
-        }
-        // Page will fire getMiniCart; do not issue our own (often 404) refresh.
+        removeLocalLineByProductKey(productKey);
         return;
       }
 
-      // Non-zero quantity updates: merge changed line(s) if present.
-      const lines = extractNapaCartLines(data);
-      if (lines.length) {
-        applyCartLines(lines, { replace: false });
-      } else if (data?.entry) {
+      // Qty change: optimistic merge of the changed line only.
+      if (data?.entry) {
         const line = normalizeEntry(data.entry);
         if (line) applyCartLines([line], { replace: false });
       }
       return;
     }
 
-    // ATC: merge added lines. Page getMiniCart supplies the full snapshot next.
+    // ATC: optimistic merge of the newly added line(s) only.
     if (
       isNapaAtcUrl(sourceHint) ||
       (Array.isArray(data?.cartModifications) && data.cartModifications.length)
     ) {
-      const lines = extractNapaCartLines(data);
-      if (lines.length) {
-        applyCartLines(lines, { replace: false });
-        lastAtcAt = Date.now();
-        lastRemoveAt = 0;
-        removeLineFloor = 0;
-        lastRemovedProductKey = '';
-      }
+      const lines = extractAtcLines(data);
+      if (lines.length) applyCartLines(lines, { replace: false });
       return;
-    }
-
-    // Other cart payloads with entries (e.g. non-miniCart cart GETs):
-    // only replace when the snapshot is at least as complete as what we have;
-    // otherwise merge so partial responses cannot shrink the cart.
-    if (Array.isArray(data?.entries) || Array.isArray(data?.cart?.entries)) {
-      const lines = extractNapaCartLines(data);
-      const totalHint = entryCountHint(data, lines);
-      const looksComplete =
-        lines.length >= networkLines.length ||
-        (totalHint > 0 && lines.length >= totalHint) ||
-        (lines.length === 0 && isAuthoritativeEmptyCart(data, status));
-
-      if (looksComplete) {
-        applyCartLines(lines, { replace: true });
-      } else if (lines.length) {
-        applyCartLines(lines, { replace: false });
-      }
     }
   }
 
@@ -662,9 +577,6 @@
   function resetCart() {
     networkLines = [];
     lastSentSignature = '';
-    lastRemoveAt = Date.now();
-    removeLineFloor = 0;
-    lastRemovedProductKey = '';
     void pushCartUpdate(true);
   }
 
@@ -745,7 +657,6 @@
         }
       }
       if (looksLikeRemove) {
-        lastRemoveAt = Date.now();
         window.setTimeout(() => requestMiniCartRefresh(), 500);
       }
     },
@@ -793,17 +704,8 @@
     );
     if (nextSig === lastSentSignature) return;
 
-    // Ignore out-of-order storage writes that shrink/wipe the cart.
-    if (nextLines.length < networkLines.length) {
-      const recentRemove = Date.now() - lastRemoveAt < 8000;
-      // After deleting one of several lines, never accept a full wipe from storage.
-      if (!recentRemove || nextLines.length === 0) {
-        void pushCartUpdate(true);
-        return;
-      }
-    }
-
-    networkLines = nextLines.map((line) => ({ ...line }));
-    lastSentSignature = nextSig;
+    // NAPA tab owns cart sync via getMiniCart. Ignore stale storage echoes
+    // (including older fuller carts that would undo a delete).
+    void pushCartUpdate(true);
   });
 })();
