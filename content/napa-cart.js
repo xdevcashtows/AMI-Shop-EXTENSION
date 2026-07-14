@@ -460,13 +460,58 @@
   }
 
   function shouldAllowMiniCartShrink(lines, data) {
-    const isEmpty =
-      lines.length === 0 &&
-      (Number(data?.totalItems) === 0 ||
-        Number(data?.totalUnitCount) === 0 ||
-        (Array.isArray(data?.entries) && data.entries.length === 0));
-    if (isEmpty) return true;
-    if (Date.now() - lastRemoveAt < 4000) return true;
+    // Only allow a non-empty smaller snapshot after an intentional remove.
+    // Empty clears are handled separately with stricter 200-OK checks so
+    // getMiniCart 404 bodies cannot wipe the cart.
+    if (lines.length > 0 && Date.now() - lastRemoveAt < 8000) return true;
+    return false;
+  }
+
+  function isAuthoritativeEmptyCart(data, status) {
+    if (Number.isFinite(status) && status !== 200) return false;
+    if (!data || typeof data !== 'object') return false;
+    if (data.error || Array.isArray(data.errors)) return false;
+    const total =
+      Number(data.totalItems) ||
+      Number(data.totalUnitCount) ||
+      Number(data.deliveryItemsQuantity);
+    if (total > 0) return false;
+    if (Array.isArray(data.entries) && data.entries.length === 0) return true;
+    if (Array.isArray(data.cart?.entries) && data.cart.entries.length === 0) {
+      return true;
+    }
+    return total === 0 && Boolean(data.code);
+  }
+
+  function productKeyFromUrl(sourceHint) {
+    const match = String(sourceHint || '').match(/[?&]product=([^&]+)/i);
+    if (!match?.[1]) return '';
+    try {
+      return decodeURIComponent(match[1]).toUpperCase();
+    } catch {
+      return match[1].toUpperCase();
+    }
+  }
+
+  function removeLocalLineByProductKey(productKey) {
+    if (!productKey) return false;
+    const before = networkLines.length;
+    networkLines = networkLines.filter((line) => {
+      const externalId = String(line.externalId || '').toUpperCase();
+      const partNumber = String(line.partNumber || '').toUpperCase();
+      if (!externalId && !partNumber) return true;
+      if (externalId && (externalId === productKey || productKey.endsWith(`_${externalId}`))) {
+        return false;
+      }
+      if (partNumber && (productKey === partNumber || productKey.endsWith(`_${partNumber}`))) {
+        return false;
+      }
+      return true;
+    });
+    if (networkLines.length !== before) {
+      void pushCartUpdate(true);
+      return true;
+    }
     return false;
   }
 
@@ -480,6 +525,12 @@
 
     rememberSponsorPk(sourceHint);
     rememberCartApiFromUrl(sourceHint);
+
+    const status = Number(meta?.status);
+    // 404/5xx getMiniCart bodies were being parsed as empty carts and wiping Shop Cart.
+    if (Number.isFinite(status) && status >= 400) {
+      return;
+    }
 
     let data = payload;
     if (typeof payload === 'string') {
@@ -518,11 +569,17 @@
     // to wipe the extension cart down to a single line.
     if (isNapaMiniCartUrl(sourceHint)) {
       const lines = extractNapaCartLines(data);
-      const shrinks =
-        lines.length > 0 && lines.length < networkLines.length;
-      if (shrinks && !shouldAllowMiniCartShrink(lines, data)) {
-        // Stale/wrong-cart snapshot (network log showed 2.3KB vs 2.8KB races).
-        // Keep the fuller cart; optionally retry once after ATC.
+
+      if (lines.length === 0) {
+        if (!isAuthoritativeEmptyCart(data, status)) return;
+        applyCartLines([], { replace: true });
+        return;
+      }
+
+      if (
+        lines.length < networkLines.length &&
+        !shouldAllowMiniCartShrink(lines, data)
+      ) {
         if (Date.now() - lastAtcAt < 5000) {
           window.setTimeout(() => requestMiniCartRefresh(), 600);
         }
@@ -532,22 +589,42 @@
       return;
     }
 
-    // ATC: merge added lines, then refresh mini-cart for full snapshot.
-    if (isNapaAtcUrl(sourceHint) || Array.isArray(data?.cartModifications)) {
+    // Quantity update / remove (product=…&quantity=0).
+    // ProLink's entries response (~2.8KB) often includes the remaining cart —
+    // apply that directly so a later getMiniCart 404 cannot blank Shop Cart.
+    if (isNapaEntriesMutationUrl(sourceHint)) {
+      const isRemove = /[?&]quantity=0(?:&|$)/i.test(String(sourceHint || ''));
+      if (isRemove) lastRemoveAt = Date.now();
+
       const lines = extractNapaCartLines(data);
-      if (lines.length) {
-        applyCartLines(lines, { replace: false });
-        lastAtcAt = Date.now();
+      const hasEntries =
+        Array.isArray(data?.entries) || Array.isArray(data?.cart?.entries);
+
+      if (hasEntries) {
+        if (lines.length > 0) {
+          applyCartLines(lines, { replace: true });
+        } else if (isRemove && isAuthoritativeEmptyCart(data, status)) {
+          applyCartLines([], { replace: true });
+        } else if (isRemove) {
+          removeLocalLineByProductKey(productKeyFromUrl(sourceHint));
+        }
+      } else if (isRemove) {
+        removeLocalLineByProductKey(productKeyFromUrl(sourceHint));
       }
+
       window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
     }
 
-    // Quantity update / remove (product=…&quantity=0) — refresh mini-cart.
-    // Do not apply partial `entries` from these responses as a full replace.
-    if (isNapaEntriesMutationUrl(sourceHint)) {
-      if (/[?&]quantity=0(?:&|$)/i.test(String(sourceHint || ''))) {
-        lastRemoveAt = Date.now();
+    // ATC: merge added lines, then refresh mini-cart for full snapshot.
+    if (
+      isNapaAtcUrl(sourceHint) ||
+      (Array.isArray(data?.cartModifications) && data.cartModifications.length)
+    ) {
+      const lines = extractNapaCartLines(data);
+      if (lines.length) {
+        applyCartLines(lines, { replace: false });
+        lastAtcAt = Date.now();
       }
       window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
@@ -562,7 +639,7 @@
       const looksComplete =
         lines.length >= networkLines.length ||
         (totalHint > 0 && lines.length >= totalHint) ||
-        (lines.length === 0 && totalHint === 0);
+        (lines.length === 0 && isAuthoritativeEmptyCart(data, status));
 
       if (looksComplete) {
         applyCartLines(lines, { replace: true });
@@ -597,7 +674,8 @@
       const data = event.data;
       if (!data || data.source !== 'ami-parts-bridge-network') return;
       ingestPayload(data.body, data.url, data.kind, data.method, {
-        generation: data.generation
+        generation: data.generation,
+        status: data.status
       });
     });
   }
@@ -741,14 +819,14 @@
     );
     if (nextSig === lastSentSignature) return;
 
-    // Ignore out-of-order storage writes that shrink the cart (stale push race).
-    if (
-      nextLines.length > 0 &&
-      nextLines.length < networkLines.length &&
-      Date.now() - lastRemoveAt >= 4000
-    ) {
-      void pushCartUpdate(true);
-      return;
+    // Ignore out-of-order storage writes that shrink/wipe the cart.
+    if (nextLines.length < networkLines.length) {
+      const recentRemove = Date.now() - lastRemoveAt < 8000;
+      // After deleting one of several lines, never accept a full wipe from storage.
+      if (!recentRemove || nextLines.length === 0) {
+        void pushCartUpdate(true);
+        return;
+      }
     }
 
     networkLines = nextLines.map((line) => ({ ...line }));

@@ -6,7 +6,7 @@
   const FETCH_SOURCE = 'ami-parts-bridge-fetch-miniquote';
   const NAPA_FETCH_SOURCE = 'ami-parts-bridge-fetch-napa-minicart';
 
-  function emit(url, body, kind, method) {
+  function emit(url, body, kind, method, status, extra) {
     try {
       window.postMessage(
         {
@@ -14,7 +14,9 @@
           url: String(url || ''),
           body,
           kind: kind || 'response',
-          method: method || ''
+          method: method || '',
+          status: status == null ? undefined : Number(status),
+          ...(extra && typeof extra === 'object' ? extra : {})
         },
         '*'
       );
@@ -120,10 +122,10 @@
       doFetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
         .then((response) => response.text().then((text) => ({ response, text })))
         .then(({ response, text }) => {
-          emit(response.url || url, text, 'response', 'GET');
+          emit(response.url || url, text, 'response', 'GET', response.status);
         })
         .catch(() => {
-          emit(url, JSON.stringify({ quoteDetails: [], totalItems: 0 }), 'response', 'GET');
+          // Do not emit an empty quote on failure — that falsely clears the cart.
         });
       return;
     }
@@ -131,7 +133,6 @@
     if (data.source === NAPA_FETCH_SOURCE) {
       const cartCode = String(data.cartCode || '').trim();
       if (!cartCode) {
-        emit('', JSON.stringify({ error: 'missing cart code' }), 'response', 'GET');
         return;
       }
       const params = new URLSearchParams({ fields: 'DEFAULT' });
@@ -156,38 +157,14 @@
       doFetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
         .then((response) => response.text().then((text) => ({ response, text })))
         .then(({ response, text }) => {
-          try {
-            window.postMessage(
-              {
-                source: SOURCE,
-                url: String(response.url || url),
-                body: text,
-                kind: 'response',
-                method: 'GET',
-                generation
-              },
-              '*'
-            );
-          } catch (_) {
-            // ignore
-          }
+          // Never treat 404/5xx as an empty cart — that wiped Shop Cart on remove.
+          if (!response.ok) return;
+          emit(response.url || url, text, 'response', 'GET', response.status, {
+            generation
+          });
         })
         .catch(() => {
-          try {
-            window.postMessage(
-              {
-                source: SOURCE,
-                url,
-                body: JSON.stringify({ code: cartCode, entries: [], totalItems: 0 }),
-                kind: 'response',
-                method: 'GET',
-                generation
-              },
-              '*'
-            );
-          } catch (_) {
-            // ignore
-          }
+          // Ignore network failures; keep the last known good cart.
         });
     }
   });
@@ -234,7 +211,9 @@
             : (args[0] && args[0].url) || url;
         clone
           .text()
-          .then((text) => emit(responseUrl, text, 'response', method))
+          .then((text) =>
+            emit(responseUrl, text, 'response', method, response.status)
+          )
           .catch(() => {});
       } catch (_) {
         // ignore
@@ -278,7 +257,8 @@
             this.__amiUrl || '',
             this.responseText || '',
             'response',
-            String(this.__amiMethod || 'GET').toUpperCase()
+            String(this.__amiMethod || 'GET').toUpperCase(),
+            this.status
           );
         } catch (_) {
           // ignore
