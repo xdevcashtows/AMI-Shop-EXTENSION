@@ -2,6 +2,9 @@
   const VENDOR = 'NAPA';
   const Ami = globalThis.AmiChrome;
 
+  /** Live ProLink uses /users/ — /orgUsers/ getMiniCart returns 404. */
+  const DEFAULT_CART_PREFIX = '/occ/v2/prolinkus/users/current/carts/';
+
   /** @type {any[]} */
   let networkLines = [];
   /** @type {string} */
@@ -10,17 +13,8 @@
   let lastCartCode = '';
   /** @type {string} */
   let lastSponsorPk = '';
-  /**
-   * OCC cart path prefix from the page's own cart URL.
-   * ProLink uses orgUsers (not users) — wrong prefix causes getMiniCart 404s.
-   */
-  let lastCartApiPrefix = '/occ/v2/prolinkus/orgUsers/current/carts/';
-  /** @type {{ data: any, status: number, started: number, lineCount: number } | null} */
-  let pendingMiniCart = null;
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let pendingMiniCartTimer = null;
-  /** Only apply getMiniCart responses from requests started at/after this time. */
-  let lastAppliedMiniCartStart = 0;
+  /** @type {string} */
+  let lastCartApiPrefix = DEFAULT_CART_PREFIX;
   let dead = false;
 
   function markDead() {
@@ -36,10 +30,6 @@
     const cleaned = String(text).replace(/[^0-9.-]/g, '');
     const value = Number(cleaned);
     return Number.isFinite(value) ? value : undefined;
-  }
-
-  function textOf(el) {
-    return (el?.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
   function findVinInputs() {
@@ -90,7 +80,6 @@
   function rememberCartCode(value) {
     const code = String(value || '').trim();
     if (!code) return;
-    // Cookie form: NPPLK-000056Z870_#_200457466
     const cleaned = code.split('_#_')[0].split('#')[0].trim();
     if (/^NPPLK-/i.test(cleaned) || /^[A-Z0-9-]{8,}$/i.test(cleaned)) {
       lastCartCode = cleaned;
@@ -105,18 +94,26 @@
     }
   }
 
-  /** Learn cart code + API path from any intercepted carts/... URL. */
+  /** Always normalize to /users/ — orgUsers getMiniCart 404s on ProLink. */
+  function normalizeCartApiPrefix(prefix) {
+    const raw = String(prefix || '').trim();
+    if (!/^\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/$/i.test(raw)) {
+      return DEFAULT_CART_PREFIX;
+    }
+    return raw.replace(/\/orgUsers\//i, '/users/');
+  }
+
   function rememberCartApiFromUrl(sourceHint) {
     const hint = String(sourceHint || '');
     const match = hint.match(
-      /(\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/)([^/?#]+)/i
+      /(\/occ\/v2\/[^/]+\/)(?:org)?users(\/current\/carts\/)([^/?#]+)/i
     );
     if (!match) return;
-    lastCartApiPrefix = match[1];
+    lastCartApiPrefix = normalizeCartApiPrefix(`${match[1]}users${match[2]}`);
     try {
-      rememberCartCode(decodeURIComponent(match[2]));
+      rememberCartCode(decodeURIComponent(match[3]));
     } catch {
-      rememberCartCode(match[2]);
+      rememberCartCode(match[3]);
     }
   }
 
@@ -132,6 +129,20 @@
     return lastCartCode;
   }
 
+  function readSponsorPkFromPage() {
+    try {
+      const profile = window.customerProfile?.getCustomerProfile;
+      const pk =
+        profile?.selectedSponsor?.sponsorPk ||
+        profile?.primarySponsor?.sponsorPk ||
+        profile?.sponsors?.[0]?.sponsorPk;
+      if (pk) lastSponsorPk = String(pk);
+    } catch {
+      // ignore
+    }
+    return lastSponsorPk;
+  }
+
   function resolveCartCode() {
     if (lastCartCode) return lastCartCode;
     return readCartCodeFromCookie();
@@ -140,9 +151,14 @@
   function resolveSponsorPk() {
     if (lastSponsorPk) return lastSponsorPk;
     rememberSponsorPk(window.location.href);
-    return lastSponsorPk;
+    if (lastSponsorPk) return lastSponsorPk;
+    return readSponsorPkFromPage();
   }
 
+  /**
+   * Map getMiniCart cartWsDTO entries → Shop Cart lines.
+   * Prefer lineAbbr_partNumber; never treat product.code "NON_NAPA" as the SKU.
+   */
   function normalizeEntry(entry) {
     if (!entry || typeof entry !== 'object') return null;
 
@@ -151,17 +167,19 @@
     const partNumber = String(
       entry.partNumber ||
         product.partNumber ||
-        (typeof product.code === 'string' && product.code.includes('_')
+        (typeof product.code === 'string' &&
+        product.code &&
+        !/^NON[_-]?NAPA$/i.test(product.code) &&
+        product.code.includes('_')
           ? product.code.split('_').slice(1).join('_')
-          : product.code) ||
+          : !/^NON[_-]?NAPA$/i.test(String(product.code || ''))
+            ? product.code
+            : '') ||
         ''
     ).trim();
 
     const rawDescription = String(
-      entry.partDescription ||
-        product.description ||
-        product.name ||
-        ''
+      entry.partDescription || product.description || product.name || ''
     ).trim();
 
     const description =
@@ -188,11 +206,14 @@
     ).trim();
 
     const productCode = String(product.code || '').trim();
+    const usableProductCode =
+      productCode && !/^NON[_-]?NAPA$/i.test(productCode) ? productCode : '';
     const externalId =
-      productCode ||
       (entry.lineAbbr && partNumber
         ? `${entry.lineAbbr}_${partNumber}`
-        : partNumber) ||
+        : '') ||
+      usableProductCode ||
+      partNumber ||
       undefined;
 
     return {
@@ -204,294 +225,59 @@
       listPrice: parseMoney(entry.listPrice),
       vendor: VENDOR,
       unit: 'pc.',
-      externalId,
-      _hasRealDescription: Boolean(description)
+      externalId
     };
   }
 
-  /** Parse ATC cartModifications (partial — one added line). */
-  function extractAtcLines(data) {
-    /** @type {Map<string, any>} */
-    const map = new Map();
-
-    function push(raw) {
-      const line = normalizeEntry(raw);
-      if (!line) return;
-      const key = (
-        line.externalId ||
-        line.partNumber ||
-        line.description ||
-        ''
-      ).toUpperCase();
-      if (!key) return;
-      map.set(key, line);
-    }
-
-    if (data?.code) rememberCartCode(data.code);
-    if (Array.isArray(data?.cartModifications)) {
-      data.cartModifications.forEach((mod) => {
-        if (mod?.entry) push(mod.entry);
-      });
-    }
-    return Array.from(map.values());
-  }
-
-  /**
-   * Parse getMiniCart / full cart snapshots from `entries` only.
-   * Never use cartModifications here — those are partial ATC leftovers and
-   * were collapsing a 3-line mini-cart down to 1 line.
-   */
-  function findCartEntriesArray(data) {
+  function extractMiniCartLines(data) {
     if (!data || typeof data !== 'object') return null;
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data.entries)) return data.entries;
-    if (Array.isArray(data.cart?.entries)) return data.cart.entries;
-    if (Array.isArray(data.miniCart?.entries)) return data.miniCart.entries;
-    if (Array.isArray(data.miniCartEntries)) return data.miniCartEntries;
-    if (Array.isArray(data.orderEntries)) return data.orderEntries;
-    if (Array.isArray(data.entryList)) return data.entryList;
-    if (Array.isArray(data.items)) return data.items;
-    if (Array.isArray(data.products)) return data.products;
-    return null;
+    if (data.code) rememberCartCode(data.code);
+    if (!Array.isArray(data.entries)) return null;
+    return data.entries.map(normalizeEntry).filter(Boolean);
   }
 
-  /**
-   * ProLink writes the live header cart to localStorage key "mini-cart".
-   * That is the simplest source of truth — mirror it 1:1 into Shop Cart.
-   */
-  function extractLocalStorageMiniCartLines(raw) {
-    if (raw == null) return [];
-    let data = raw;
-    if (typeof raw === 'string') {
-      const trimmed = raw.trim();
-      if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return [];
-      try {
-        data = JSON.parse(trimmed);
-      } catch {
-        return null;
-      }
-    }
-    if (data == null) return [];
-    if (typeof data === 'string') {
-      try {
-        data = JSON.parse(data);
-      } catch {
-        return null;
-      }
-    }
-
-    let lines = extractMiniCartLines(data);
-    if (lines != null) return lines;
-
-    // Redux-persist / nested wrappers sometimes bury entries deeper.
-    lines = extractGraphqlCartLines(data);
-    if (lines != null) return lines;
-
-    // Empty cart object with no entries array.
-    if (typeof data === 'object' && !Array.isArray(data)) {
-      const entries = findCartEntriesArray(data);
-      if (entries && entries.length === 0) return [];
-      if (
-        Number(data.totalItems || data.totalUnitCount || data.cartCount || 0) === 0 &&
-        !findCartEntriesArray(data)
-      ) {
-        return [];
-      }
-    }
-    return null;
+  function applyCartLines(quoteLines) {
+    networkLines = quoteLines;
+    void pushCartUpdate(true);
   }
 
-  function applyLocalStorageMiniCart(raw) {
-    const lines = extractLocalStorageMiniCartLines(raw);
+  function applyMiniCartDto(data) {
+    const lines = extractMiniCartLines(data);
     if (lines == null) return false;
     const signature = JSON.stringify(
       lines.map((l) => [l.partNumber, l.description, l.quantity, l.cost, l.externalId])
     );
     const currentSig = JSON.stringify(
-      networkLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost, l.externalId])
+      networkLines.map((l) => [
+        l.partNumber,
+        l.description,
+        l.quantity,
+        l.cost,
+        l.externalId
+      ])
     );
-    lastAppliedMiniCartStart = Date.now();
     if (signature === currentSig && signature === lastSentSignature) {
       return true;
     }
-    applyCartLines(lines, { replace: true });
+    applyCartLines(lines);
     return true;
-  }
-
-  function readLocalStorageMiniCart() {
-    try {
-      return window.localStorage.getItem('mini-cart');
-    } catch {
-      return null;
-    }
-  }
-
-  function syncFromLocalStorageMiniCart() {
-    const raw = readLocalStorageMiniCart();
-    if (raw == null) return false;
-    return applyLocalStorageMiniCart(raw);
-  }
-
-  function extractMiniCartLines(data) {
-    /** @type {Map<string, any>} */
-    const map = new Map();
-
-    function push(raw) {
-      const line = normalizeEntry(raw);
-      if (!line) return;
-      const key = (
-        line.externalId ||
-        line.partNumber ||
-        line.description ||
-        ''
-      ).toUpperCase();
-      if (!key) return;
-      const prev = map.get(key);
-      if (!prev) {
-        map.set(key, line);
-        return;
-      }
-      if (
-        (line._hasRealDescription && !prev._hasRealDescription) ||
-        (line.cost != null && prev.cost == null)
-      ) {
-        map.set(key, { ...prev, ...line });
-      }
-    }
-
-    if (data?.code) rememberCartCode(data.code);
-    const nestedCart =
-      data?.cart && typeof data.cart === 'object' ? data.cart : null;
-    if (nestedCart?.code) rememberCartCode(nestedCart.code);
-
-    const entries = findCartEntriesArray(data);
-    if (!entries) return null;
-    entries.forEach((entry) => push(entry));
-    return Array.from(map.values());
-  }
-
-  function enrichDescriptionFromDom(lines) {
-    return lines.map((line) => {
-      if (!line.partNumber) return line;
-      if (line.description && line.description !== line.partNumber) return line;
-
-      const needle = line.partNumber.toUpperCase();
-      /** @type {Element[]} */
-      const candidates = [];
-      try {
-        document
-          .querySelectorAll('tr, [class*="product" i], [class*="part" i], li')
-          .forEach((el) => {
-            if (el.closest('#ami-parts-bridge-root')) return;
-            const text = textOf(el).toUpperCase();
-            if (text.includes(needle)) candidates.push(el);
-          });
-      } catch {
-        // ignore
-      }
-
-      for (const el of candidates) {
-        const text = textOf(el);
-        const cleaned = text
-          .replace(new RegExp(line.partNumber, 'ig'), ' ')
-          .replace(/\$[\d,]+(?:\.\d{2})?/g, ' ')
-          .replace(/\bqty\b|\bquantity\b|\badd to cart\b|\bin stock\b/gi, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-        if (cleaned.length >= 8 && cleaned.length <= 160) {
-          return { ...line, description: cleaned };
-        }
-      }
-      return line;
-    });
-  }
-
-  function isLocalStorageMiniCartSource(sourceHint) {
-    return /localstorage:mini-cart/i.test(String(sourceHint || ''));
-  }
-
-  function isNapaCartUrl(sourceHint) {
-    const hint = String(sourceHint || '').toLowerCase();
-    return (
-      isLocalStorageMiniCartSource(hint) ||
-      /\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\//i.test(hint) ||
-      /\/carts\/[^/]+\/getminicart/i.test(hint) ||
-      /\/entries\/multi\/atc/i.test(hint) ||
-      (/\/entries\?/i.test(hint) && /sponsorpk=/i.test(hint))
-    );
   }
 
   function isNapaMiniCartUrl(sourceHint) {
     return /\/getminicart/i.test(String(sourceHint || ''));
   }
 
-  function isNapaAtcUrl(sourceHint) {
-    return /\/entries\/multi\/atc/i.test(String(sourceHint || ''));
-  }
-
-  function isNapaEntriesMutationUrl(sourceHint) {
+  function isNapaCartMutationUrl(sourceHint) {
     const hint = String(sourceHint || '');
     return (
-      /\/entries\?/i.test(hint) &&
-      /sponsorpk=/i.test(hint.toLowerCase()) &&
-      !isNapaAtcUrl(hint)
+      /\/entries\/multi\/atc/i.test(hint) ||
+      (/\/entries\?/i.test(hint) && /sponsorpk=/i.test(hint.toLowerCase()))
     );
-  }
-
-  function isCartMutationPayload(data, sourceHint, kind) {
-    const hint = `${String(sourceHint || '')} ${kind || ''}`.toLowerCase();
-
-    if (/linkedin|adobe|google-analytics|fullstory|g\/collect|cls_report/i.test(hint)) {
-      return false;
-    }
-
-    if (/graphql/i.test(hint)) {
-      return kind !== 'request';
-    }
-
-    if (isNapaCartUrl(hint)) {
-      return kind !== 'request';
-    }
-
-    if (data && typeof data === 'object') {
-      if (Array.isArray(data.entries) && data.code) return true;
-      if (Array.isArray(data.cartModifications) && data.code) return true;
-    }
-
-    return false;
-  }
-
-  function applyCartLines(quoteLines, { replace = true } = {}) {
-    const cleaned = quoteLines.map((line) => {
-      const { _hasRealDescription, ...rest } = line;
-      return rest;
-    });
-
-    if (replace) {
-      networkLines = cleaned;
-    } else if (cleaned.length) {
-      const map = new Map(
-        networkLines.map((line) => [
-          (line.externalId || line.partNumber || '').toUpperCase(),
-          line
-        ])
-      );
-      cleaned.forEach((line) => {
-        const key = (line.externalId || line.partNumber || '').toUpperCase();
-        if (!key) return;
-        map.set(key, { ...(map.get(key) || {}), ...line });
-      });
-      networkLines = Array.from(map.values());
-    }
-
-    if (networkLines.length) {
-      networkLines = enrichDescriptionFromDom(networkLines);
-    }
-    void pushCartUpdate(true);
   }
 
   function requestMiniCartRefresh() {
     readCartCodeFromCookie();
+    resolveSponsorPk();
     const cartCode = resolveCartCode();
     if (!cartCode) {
       void pushCartUpdate(true);
@@ -503,7 +289,7 @@
           source: 'ami-parts-bridge-fetch-napa-minicart',
           cartCode,
           sponsorPk: resolveSponsorPk(),
-          cartApiPrefix: lastCartApiPrefix
+          cartApiPrefix: normalizeCartApiPrefix(lastCartApiPrefix)
         },
         '*'
       );
@@ -514,177 +300,17 @@
     }
   }
 
-  function looksLikeCartEntry(item) {
-    if (!item || typeof item !== 'object') return false;
-    if (item.product || item.partNumber || item.partDescription) return true;
-    if (item.quantity != null && (item.basePrice || item.totalPrice)) return true;
-    return false;
-  }
-
-  /**
-   * ProLink hydrates saved carts over GraphQL on first paint (no getMiniCart).
-   * Walk the payload for the best cart-like entries array.
-   */
-  function extractGraphqlCartLines(data) {
-    /** @type {{ entries: any[], score: number }[]} */
-    const candidates = [];
-
-    function consider(entries, path) {
-      if (!Array.isArray(entries) || !entries.length) return;
-      if (!entries.every(looksLikeCartEntry)) return;
-      const pathL = String(path || '').toLowerCase();
-      let score = entries.length;
-      if (/cart|basket|minicart|bag/i.test(pathL)) score += 100;
-      if (/search|catalog|result|facet|productlist/i.test(pathL) && !/cart/i.test(pathL)) {
-        score -= 80;
-      }
-      candidates.push({ entries, score });
-    }
-
-    function walk(node, path, depth) {
-      if (!node || depth > 10) return;
-      if (Array.isArray(node)) {
-        consider(node, path);
-        node.slice(0, 20).forEach((item, i) => walk(item, `${path}[${i}]`, depth + 1));
-        return;
-      }
-      if (typeof node !== 'object') return;
-      if (node.code) rememberCartCode(node.code);
-      if (Array.isArray(node.entries)) consider(node.entries, `${path}.entries`);
-      Object.keys(node).forEach((key) => {
-        walk(node[key], path ? `${path}.${key}` : key, depth + 1);
-      });
-    }
-
-    walk(data, '', 0);
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => b.score - a.score);
-    const best = candidates[0];
-    if (best.score < 1) return null;
-
-    /** @type {Map<string, any>} */
-    const map = new Map();
-    best.entries.forEach((raw) => {
-      const line = normalizeEntry(raw);
-      if (!line) return;
-      const key = (
-        line.externalId ||
-        line.partNumber ||
-        line.description ||
-        ''
-      ).toUpperCase();
-      if (!key) return;
-      map.set(key, line);
-    });
-    const lines = Array.from(map.values());
-    return lines.length ? lines : null;
-  }
-
-  function lineMatchesProductKey(line, productKey) {
-    const key = String(productKey || '').toUpperCase();
-    if (!key || !line) return false;
-    const partFromKey = key.includes('_') ? key.split('_').slice(1).join('_') : key;
-    const externalId = String(line.externalId || '').toUpperCase();
-    const partNumber = String(line.partNumber || '').toUpperCase();
-    if (externalId && externalId === key) return true;
-    if (partFromKey && partNumber === partFromKey) return true;
-    if (partFromKey && externalId === partFromKey) return true;
-    if (partFromKey && externalId.endsWith(`_${partFromKey}`)) return true;
-    return false;
-  }
-
-  function productKeyFromUrl(sourceHint) {
-    const match = String(sourceHint || '').match(/[?&]product=([^&]+)/i);
-    if (!match?.[1]) return '';
-    try {
-      return decodeURIComponent(match[1]).toUpperCase();
-    } catch {
-      return match[1].toUpperCase();
-    }
-  }
-
-  function removeLocalLineByProductKey(productKey) {
-    if (!productKey) return false;
-    const before = networkLines.length;
-    networkLines = networkLines.filter(
-      (line) => !lineMatchesProductKey(line, productKey)
-    );
-    if (networkLines.length !== before) {
-      void pushCartUpdate(true);
-      return true;
-    }
-    return false;
-  }
-
-  /** Authoritative sync: whatever getMiniCart says is the Shop Cart. */
-  function applyMiniCartSnapshot(data, status) {
-    if (Number.isFinite(status) && status >= 400) return;
-    if (!data || typeof data !== 'object') return;
-    if (data.error || Array.isArray(data.errors)) return;
-
-    const lines = extractMiniCartLines(data);
-    if (lines == null) return;
-    applyCartLines(lines, { replace: true });
-  }
-
-  /**
-   * Coalesce parallel getMiniCart responses. Prefer the newest *request*
-   * (by requestStartedAt), not whichever response finished last — an older
-   * in-flight 1-line snapshot was overwriting a newer 3-line cart.
-   */
-  function queueMiniCartSnapshot(data, status, requestStartedAt) {
-    const lines = extractMiniCartLines(data);
-    if (lines == null) return;
-
-    const started = Number(requestStartedAt);
-    const startedAt = Number.isFinite(started) && started > 0 ? started : Date.now();
-    if (startedAt < lastAppliedMiniCartStart) return;
-
-    if (
-      !pendingMiniCart ||
-      startedAt > pendingMiniCart.started ||
-      (startedAt === pendingMiniCart.started &&
-        lines.length >= pendingMiniCart.lineCount)
-    ) {
-      pendingMiniCart = {
-        data,
-        status: Number(status) || 200,
-        started: startedAt,
-        lineCount: lines.length
-      };
-    }
-
-    if (pendingMiniCartTimer) window.clearTimeout(pendingMiniCartTimer);
-    pendingMiniCartTimer = window.setTimeout(() => {
-      pendingMiniCartTimer = null;
-      const snap = pendingMiniCart;
-      pendingMiniCart = null;
-      if (!snap) return;
-      if (snap.started < lastAppliedMiniCartStart) return;
-      lastAppliedMiniCartStart = snap.started;
-      applyMiniCartSnapshot(snap.data, snap.status);
-    }, 180);
-  }
-
   function ingestPayload(payload, sourceHint, kind, method, meta) {
     if (payload == null) return;
-    if (kind === 'request') {
-      rememberSponsorPk(sourceHint);
-      rememberCartApiFromUrl(sourceHint);
-      return;
-    }
 
     rememberSponsorPk(sourceHint);
     rememberCartApiFromUrl(sourceHint);
 
-    // Primary sync path: ProLink's own mini-cart localStorage mirror.
-    if (isLocalStorageMiniCartSource(sourceHint)) {
-      if (typeof payload === 'string' && !payload.trim()) {
-        lastAppliedMiniCartStart = Date.now();
-        applyCartLines([], { replace: true });
-        return;
+    if (kind === 'request') {
+      // Cart mutations: refresh from getMiniCart; never trust mutation bodies.
+      if (isNapaCartMutationUrl(sourceHint)) {
+        window.setTimeout(() => requestMiniCartRefresh(), 400);
       }
-      applyLocalStorageMiniCart(payload);
       return;
     }
 
@@ -693,78 +319,28 @@
       return;
     }
 
-    let data = payload;
-    if (typeof payload === 'string') {
-      const trimmed = payload.trim();
-      if (!trimmed) return;
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        try {
-          data = JSON.parse(trimmed);
-        } catch {
-          return;
-        }
-      } else {
-        return;
-      }
-    }
-
-    if (!isCartMutationPayload(data, sourceHint, kind)) {
-      return;
-    }
-
-    if (data?.code) rememberCartCode(data.code);
-
-    // On page load ProLink often hydrates the saved cart via GraphQL only.
-    // Prefer localStorage when present; otherwise use GraphQL as a fallback.
-    if (/graphql/i.test(String(sourceHint || ''))) {
-      if (syncFromLocalStorageMiniCart()) return;
-      const lines = extractGraphqlCartLines(data);
-      if (lines && lines.length) {
-        applyCartLines(lines, { replace: true });
+    // Only getMiniCart 2xx is source of truth.
+    if (!isNapaMiniCartUrl(sourceHint)) {
+      if (isNapaCartMutationUrl(sourceHint)) {
         window.setTimeout(() => requestMiniCartRefresh(), 400);
       }
       return;
     }
 
-    // getMiniCart backup — only if localStorage did not already win.
-    if (isNapaMiniCartUrl(sourceHint)) {
-      if (readLocalStorageMiniCart() != null) {
-        syncFromLocalStorageMiniCart();
+    let data = payload;
+    if (typeof payload === 'string') {
+      const trimmed = payload.trim();
+      if (!trimmed) return;
+      if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return;
+      try {
+        data = JSON.parse(trimmed);
+      } catch {
         return;
       }
-      queueMiniCartSnapshot(data, status, meta?.requestStartedAt);
-      return;
     }
 
-    // Remove: optimistic local drop; getMiniCart will confirm full state.
-    if (isNapaEntriesMutationUrl(sourceHint)) {
-      const isRemove =
-        /[?&]quantity=0(?:&|$)/i.test(String(sourceHint || '')) ||
-        Number(data?.quantity) === 0 ||
-        Number(data?.quantityAdded) < 0;
-
-      if (isRemove) {
-        const productKey =
-          productKeyFromUrl(sourceHint) ||
-          String(data?.entry?.product?.code || data?.entry?.partNumber || '').toUpperCase();
-        removeLocalLineByProductKey(productKey);
-        return;
-      }
-
-      // Qty change: optimistic merge of the changed line only.
-      if (data?.entry) {
-        const line = normalizeEntry(data.entry);
-        if (line) applyCartLines([line], { replace: false });
-      }
-      return;
-    }
-
-    // ATC: optimistic merge of the newly added line(s) only.
-    if (isNapaAtcUrl(sourceHint)) {
-      const lines = extractAtcLines(data);
-      if (lines.length) applyCartLines(lines, { replace: false });
-      return;
-    }
+    if (data?.errors) return;
+    applyMiniCartDto(data);
   }
 
   function installNetworkHooks() {
@@ -791,7 +367,6 @@
       const data = event.data;
       if (!data || data.source !== 'ami-parts-bridge-network') return;
       ingestPayload(data.body, data.url, data.kind, data.method, {
-        generation: data.generation,
         status: data.status,
         requestStartedAt: data.requestStartedAt
       });
@@ -799,9 +374,6 @@
   }
 
   function scrapeCartLines() {
-    if (networkLines.length) {
-      networkLines = enrichDescriptionFromDom(networkLines);
-    }
     return networkLines;
   }
 
@@ -838,22 +410,16 @@
   installNetworkHooks();
   rememberSponsorPk(window.location.href);
   readCartCodeFromCookie();
+  readSponsorPkFromPage();
 
-  // Mirror ProLink mini-cart localStorage immediately + poll as a safety net
-  // (same-tab storage events do not fire; setItem hook covers most writes).
-  syncFromLocalStorageMiniCart();
-  window.setTimeout(() => syncFromLocalStorageMiniCart(), 500);
-  window.setTimeout(() => syncFromLocalStorageMiniCart(), 1500);
-  window.setTimeout(() => syncFromLocalStorageMiniCart(), 3500);
+  // Boot + light poll: getMiniCart is the only cart mirror.
+  window.setTimeout(() => requestMiniCartRefresh(), 600);
+  window.setTimeout(() => requestMiniCartRefresh(), 1600);
+  window.setTimeout(() => requestMiniCartRefresh(), 3200);
   window.setInterval(() => {
     if (dead) return;
-    syncFromLocalStorageMiniCart();
-  }, 1000);
-
-  // Network getMiniCart remains a backup when localStorage is empty/missing.
-  window.setTimeout(() => {
-    if (!readLocalStorageMiniCart()) requestMiniCartRefresh();
-  }, 2000);
+    requestMiniCartRefresh();
+  }, 2500);
 
   window.__amiTryFillVin = tryFillVin;
 
@@ -873,7 +439,6 @@
   });
 
   window.addEventListener('ami-parts-bridge-scrape-now', () => {
-    if (syncFromLocalStorageMiniCart()) return;
     if (!requestMiniCartRefresh()) {
       void pushCartUpdate(true);
     }
@@ -886,7 +451,7 @@
       if (!(target instanceof Element)) return;
       const label = `${target.textContent || ''} ${target.getAttribute('aria-label') || ''} ${target.getAttribute('title') || ''}`.toLowerCase();
       if (/add.*cart|update.*cart|add to cart/.test(label)) {
-        window.setTimeout(() => requestMiniCartRefresh(), 900);
+        window.setTimeout(() => requestMiniCartRefresh(), 700);
       }
       let looksLikeRemove = /remove|delete|trash/.test(label);
       if (!looksLikeRemove) {
@@ -920,17 +485,16 @@
       return true;
     }
     if (message?.type === 'AMI_SCRAPE_NOW') {
-      const fromStorage = syncFromLocalStorageMiniCart();
-      const started = fromStorage ? false : requestMiniCartRefresh();
+      const started = requestMiniCartRefresh();
       window.setTimeout(() => {
         sendResponse({
           ok: true,
-          started: fromStorage || started,
+          started,
           cartCode: resolveCartCode() || null,
           lines: scrapeCartLines(),
-          source: fromStorage ? 'localStorage:mini-cart' : 'network'
+          source: 'getMiniCart'
         });
-      }, fromStorage ? 50 : 900);
+      }, 900);
       return true;
     }
     if (message?.type === 'AMI_SESSION_UPDATED' && message.resetCart) {
@@ -953,9 +517,6 @@
       nextLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
     );
     if (nextSig === lastSentSignature) return;
-
-    // NAPA tab owns cart sync via getMiniCart. Ignore stale storage echoes
-    // (including older fuller carts that would undo a delete).
     void pushCartUpdate(true);
   });
 })();

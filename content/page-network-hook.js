@@ -5,7 +5,7 @@
   const SOURCE = 'ami-parts-bridge-network';
   const FETCH_SOURCE = 'ami-parts-bridge-fetch-miniquote';
   const NAPA_FETCH_SOURCE = 'ami-parts-bridge-fetch-napa-minicart';
-  const MINI_CART_KEY = 'mini-cart';
+  const DEFAULT_NAPA_CART_PREFIX = '/occ/v2/prolinkus/users/current/carts/';
 
   function emit(url, body, kind, method, status, extra) {
     try {
@@ -26,53 +26,14 @@
     }
   }
 
-  function emitMiniCart(body) {
-    emit('localStorage:mini-cart', body == null ? '' : String(body), 'response', 'LOCAL', 200);
-  }
-
-  function readAndEmitMiniCart() {
-    try {
-      emitMiniCart(window.localStorage.getItem(MINI_CART_KEY));
-    } catch (_) {
-      // ignore
+  /** ProLink getMiniCart lives under /users/ — /orgUsers/ returns 404. */
+  function normalizeNapaCartPrefix(prefixRaw) {
+    const raw = String(prefixRaw || '').trim();
+    if (/^\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/$/i.test(raw)) {
+      return raw.replace(/\/orgUsers\//i, '/users/');
     }
+    return DEFAULT_NAPA_CART_PREFIX;
   }
-
-  // ProLink persists the live cart in localStorage key "mini-cart" (see FS_UE_LOCAL_STORAGE).
-  // Patch setItem so same-tab updates reach the extension immediately.
-  try {
-    const origSetItem = Storage.prototype.setItem;
-    Storage.prototype.setItem = function (key, value) {
-      const result = origSetItem.apply(this, arguments);
-      try {
-        if (this === window.localStorage && String(key) === MINI_CART_KEY) {
-          emitMiniCart(value);
-        }
-      } catch (_) {
-        // ignore
-      }
-      return result;
-    };
-    const origRemoveItem = Storage.prototype.removeItem;
-    Storage.prototype.removeItem = function (key) {
-      const result = origRemoveItem.apply(this, arguments);
-      try {
-        if (this === window.localStorage && String(key) === MINI_CART_KEY) {
-          emitMiniCart('');
-        }
-      } catch (_) {
-        // ignore
-      }
-      return result;
-    };
-  } catch (_) {
-    // ignore
-  }
-
-  readAndEmitMiniCart();
-  setTimeout(readAndEmitMiniCart, 400);
-  setTimeout(readAndEmitMiniCart, 1500);
-  setTimeout(readAndEmitMiniCart, 3500);
 
   function bodyToText(body) {
     if (body == null) return '';
@@ -240,12 +201,7 @@
       const params = new URLSearchParams({ fields: 'DEFAULT' });
       const sponsorPk = String(data.sponsorPk || '').trim();
       if (sponsorPk) params.set('sponsorPK', sponsorPk);
-      const prefixRaw = String(data.cartApiPrefix || '').trim();
-      const prefix = /^\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/$/i.test(
-        prefixRaw
-      )
-        ? prefixRaw
-        : '/occ/v2/prolinkus/orgUsers/current/carts/';
+      const prefix = normalizeNapaCartPrefix(data.cartApiPrefix);
       const url = `${prefix}${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
       const headers = {
         Accept: 'application/json',
