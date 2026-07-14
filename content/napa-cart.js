@@ -359,6 +359,10 @@
       return false;
     }
 
+    if (/graphql/i.test(hint)) {
+      return kind !== 'request';
+    }
+
     if (isNapaCartUrl(hint)) {
       return kind !== 'request';
     }
@@ -401,10 +405,93 @@
   }
 
   function requestMiniCartRefresh() {
-    // ProLink already calls getMiniCart after ATC/remove. Our own refreshes
-    // often 404 — only rely on intercepted page traffic.
-    void pushCartUpdate(true);
-    return Boolean(resolveCartCode());
+    readCartCodeFromCookie();
+    const cartCode = resolveCartCode();
+    if (!cartCode) {
+      void pushCartUpdate(true);
+      return false;
+    }
+    try {
+      window.postMessage(
+        {
+          source: 'ami-parts-bridge-fetch-napa-minicart',
+          cartCode,
+          sponsorPk: resolveSponsorPk(),
+          cartApiPrefix: lastCartApiPrefix
+        },
+        '*'
+      );
+      return true;
+    } catch {
+      void pushCartUpdate(true);
+      return false;
+    }
+  }
+
+  function looksLikeCartEntry(item) {
+    if (!item || typeof item !== 'object') return false;
+    if (item.product || item.partNumber || item.partDescription) return true;
+    if (item.quantity != null && (item.basePrice || item.totalPrice)) return true;
+    return false;
+  }
+
+  /**
+   * ProLink hydrates saved carts over GraphQL on first paint (no getMiniCart).
+   * Walk the payload for the best cart-like entries array.
+   */
+  function extractGraphqlCartLines(data) {
+    /** @type {{ entries: any[], score: number }[]} */
+    const candidates = [];
+
+    function consider(entries, path) {
+      if (!Array.isArray(entries) || !entries.length) return;
+      if (!entries.every(looksLikeCartEntry)) return;
+      const pathL = String(path || '').toLowerCase();
+      let score = entries.length;
+      if (/cart|basket|minicart|bag/i.test(pathL)) score += 100;
+      if (/search|catalog|result|facet|productlist/i.test(pathL) && !/cart/i.test(pathL)) {
+        score -= 80;
+      }
+      candidates.push({ entries, score });
+    }
+
+    function walk(node, path, depth) {
+      if (!node || depth > 10) return;
+      if (Array.isArray(node)) {
+        consider(node, path);
+        node.slice(0, 20).forEach((item, i) => walk(item, `${path}[${i}]`, depth + 1));
+        return;
+      }
+      if (typeof node !== 'object') return;
+      if (node.code) rememberCartCode(node.code);
+      if (Array.isArray(node.entries)) consider(node.entries, `${path}.entries`);
+      Object.keys(node).forEach((key) => {
+        walk(node[key], path ? `${path}.${key}` : key, depth + 1);
+      });
+    }
+
+    walk(data, '', 0);
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    if (best.score < 1) return null;
+
+    /** @type {Map<string, any>} */
+    const map = new Map();
+    best.entries.forEach((raw) => {
+      const line = normalizeEntry(raw);
+      if (!line) return;
+      const key = (
+        line.externalId ||
+        line.partNumber ||
+        line.description ||
+        ''
+      ).toUpperCase();
+      if (!key) return;
+      map.set(key, line);
+    });
+    const lines = Array.from(map.values());
+    return lines.length ? lines : null;
   }
 
   function lineMatchesProductKey(line, productKey) {
@@ -530,6 +617,17 @@
 
     if (data?.code) rememberCartCode(data.code);
 
+    // On page load ProLink often hydrates the saved cart via GraphQL only.
+    if (/graphql/i.test(String(sourceHint || ''))) {
+      const lines = extractGraphqlCartLines(data);
+      if (lines && lines.length) {
+        applyCartLines(lines, { replace: true });
+        // Follow up with OCC mini-cart once cart code / headers are warm.
+        window.setTimeout(() => requestMiniCartRefresh(), 400);
+      }
+      return;
+    }
+
     // getMiniCart = source of truth. Always full-replace from `entries`.
     if (isNapaMiniCartUrl(sourceHint)) {
       queueMiniCartSnapshot(data, status, meta?.requestStartedAt);
@@ -638,6 +736,11 @@
   installNetworkHooks();
   rememberSponsorPk(window.location.href);
   readCartCodeFromCookie();
+
+  // Saved NAPA carts hydrate over GraphQL on first paint — also pull OCC mini-cart
+  // after the page session/headers are ready so Shop Cart matches on open.
+  window.setTimeout(() => requestMiniCartRefresh(), 1200);
+  window.setTimeout(() => requestMiniCartRefresh(), 3000);
 
   window.__amiTryFillVin = tryFillVin;
 

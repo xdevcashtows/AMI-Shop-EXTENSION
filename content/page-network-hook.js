@@ -82,6 +82,8 @@
 
   // Capture CSRF from FirstCall's own XHR/fetch headers for later refresh calls.
   let lastCsrfFromHeader = '';
+  /** @type {Record<string, string>} */
+  let lastNapaCartHeaders = {};
   function rememberCsrfFromHeaders(headers) {
     try {
       if (!headers) return;
@@ -90,6 +92,53 @@
           (headers.get('x-csrf-token') || headers.get('X-CSRF-TOKEN'))) ||
         '';
       if (token) lastCsrfFromHeader = token;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function rememberNapaCartHeaders(headers, url) {
+    try {
+      if (!headers || !/\/occ\/v2\/|graphql/i.test(String(url || ''))) return;
+      /** @type {Record<string, string>} */
+      const next = {};
+      const keep = [
+        'accept',
+        'authorization',
+        'content-type',
+        'x-gpc-aces-user',
+        'x-gpc-bu',
+        'x-gpc-client-id',
+        'x-gpc-customer-id',
+        'x-gpc-delivery-promise',
+        'x-gpc-location-id',
+        'x-gpc-page',
+        'x-gpc-prolinkid',
+        'x-gpc-sessionid',
+        'x-gpc-storeid',
+        'x-gpc-sub-client-id',
+        'x-gpc-useragent',
+        'x-gpc-userid',
+        'x-gpc-visitorid',
+        'x-country-code'
+      ];
+      const read = (name) => {
+        if (typeof headers.get === 'function') return headers.get(name);
+        if (typeof headers === 'object') {
+          const found = Object.keys(headers).find(
+            (k) => k.toLowerCase() === name.toLowerCase()
+          );
+          return found ? headers[found] : null;
+        }
+        return null;
+      };
+      keep.forEach((name) => {
+        const value = read(name);
+        if (value) next[name] = String(value);
+      });
+      if (Object.keys(next).length) {
+        lastNapaCartHeaders = { ...lastNapaCartHeaders, ...next };
+      }
     } catch (_) {
       // ignore
     }
@@ -151,9 +200,10 @@
       const url = `${prefix}${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
       const headers = {
         Accept: 'application/json',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...lastNapaCartHeaders
       };
-      const generation = Number(data.generation) || 0;
+      const requestStartedAt = Date.now();
 
       // Use origFetch so our own refresh is not re-emitted as a page cart event
       // (avoids double-ingest). Emit once with the generation token.
@@ -164,7 +214,7 @@
           // Never treat 404/5xx as an empty cart — that wiped Shop Cart on remove.
           if (!response.ok) return;
           emit(response.url || url, text, 'response', 'GET', response.status, {
-            generation
+            requestStartedAt
           });
         })
         .catch(() => {
@@ -195,6 +245,7 @@
               const token = hdrs['x-csrf-token'] || hdrs['X-CSRF-TOKEN'] || hdrs['X-Csrf-Token'];
               if (token) lastCsrfFromHeader = String(token);
             }
+            rememberNapaCartHeaders(hdrs, url);
           }
         } catch (_) {
           // ignore
@@ -214,9 +265,12 @@
           typeof args[0] === 'string'
             ? args[0]
             : (args[0] && args[0].url) || url;
-        const extra = isMiniCartUrl(responseUrl) || isMiniCartUrl(url)
-          ? { requestStartedAt }
-          : undefined;
+        const extra =
+          isMiniCartUrl(responseUrl) || isMiniCartUrl(url)
+            ? { requestStartedAt }
+            : /graphql/i.test(String(responseUrl || url))
+              ? { requestStartedAt }
+              : undefined;
         clone
           .text()
           .then((text) =>
