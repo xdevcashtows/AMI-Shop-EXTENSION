@@ -10,8 +10,22 @@
   let lastCartCode = '';
   /** @type {string} */
   let lastSponsorPk = '';
-  /** Timestamp of last successful ATC merge — used to ignore stale mini-cart snapshots. */
+  /**
+   * OCC cart path prefix from the page's own getMiniCart URL
+   * (e.g. /occ/v2/prolinkus/users/current/carts/ or .../orgUsers/...).
+   * Must match what ProLink uses or refreshes can hit a different/stale cart.
+   */
+  let lastCartApiPrefix = '/occ/v2/prolinkus/users/current/carts/';
+  /** Timestamp of last successful ATC merge. */
   let lastAtcAt = 0;
+  /** Timestamp of last remove/clear intent (allows mini-cart to shrink). */
+  let lastRemoveAt = 0;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let pendingRefreshTimer = null;
+  let refreshInFlight = false;
+  let refreshQueuedAgain = false;
+  /** Monotonic id so late/stale mini-cart responses can be ignored. */
+  let miniCartGeneration = 0;
   let dead = false;
 
   function markDead() {
@@ -93,6 +107,21 @@
     const match = hint.match(/[?&]sponsorPK=([^&]+)/i);
     if (match?.[1]) {
       lastSponsorPk = decodeURIComponent(match[1]);
+    }
+  }
+
+  /** Learn cart code + API path from any intercepted carts/... URL. */
+  function rememberCartApiFromUrl(sourceHint) {
+    const hint = String(sourceHint || '');
+    const match = hint.match(
+      /(\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/)([^/?#]+)/i
+    );
+    if (!match) return;
+    lastCartApiPrefix = match[1];
+    try {
+      rememberCartCode(decodeURIComponent(match[2]));
+    } catch {
+      rememberCartCode(match[2]);
     }
   }
 
@@ -215,23 +244,35 @@
 
     if (data?.code) rememberCartCode(data.code);
 
+    // Nested full cart on some ATC / mutation payloads.
+    const nestedCart =
+      data?.cart && typeof data.cart === 'object' ? data.cart : null;
+    if (nestedCart?.code) rememberCartCode(nestedCart.code);
+
     // ATC responses expose cartModifications; prefer those so a partial
     // `entries` array on the same payload cannot hide the added line.
     if (Array.isArray(data?.cartModifications) && data.cartModifications.length) {
       data.cartModifications.forEach((mod) => {
         if (mod?.entry) push(mod.entry);
       });
-      // Some ATC payloads also include a fuller entries snapshot.
-      if (Array.isArray(data?.entries) && data.entries.length > map.size) {
+      const entries =
+        (Array.isArray(data?.entries) && data.entries) ||
+        (Array.isArray(nestedCart?.entries) && nestedCart.entries) ||
+        null;
+      if (entries && entries.length > map.size) {
         map.clear();
-        data.entries.forEach((entry) => push(entry));
+        entries.forEach((entry) => push(entry));
       }
       return Array.from(map.values());
     }
 
     // Mini-cart / full cart snapshot.
-    if (Array.isArray(data?.entries)) {
-      data.entries.forEach((entry) => push(entry));
+    const entries =
+      (Array.isArray(data?.entries) && data.entries) ||
+      (Array.isArray(nestedCart?.entries) && nestedCart.entries) ||
+      null;
+    if (entries) {
+      entries.forEach((entry) => push(entry));
       return Array.from(map.values());
     }
 
@@ -350,29 +391,31 @@
   }
 
   async function fetchMiniCart(cartCode) {
+    // Prefer page-world fetch only (session + same OCC path as ProLink).
+    // Content-script fetch races with the page and can return a smaller/stale
+    // cart that then overwrites the extension Shop Cart.
     const code = cartCode || resolveCartCode();
     if (!code) {
       void pushCartUpdate(true);
       return false;
     }
 
-    const sponsorPk = resolveSponsorPk();
-    const params = new URLSearchParams({ fields: 'DEFAULT' });
-    if (sponsorPk) params.set('sponsorPK', sponsorPk);
-
-    const url = `/occ/v2/prolinkus/users/current/carts/${encodeURIComponent(code)}/getMiniCart?${params.toString()}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      credentials: 'include',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json'
-      },
-      cache: 'no-store'
-    });
-    const text = await response.text();
-    ingestPayload(text, response.url || url, 'response', 'GET');
-    return response.ok;
+    try {
+      window.postMessage(
+        {
+          source: 'ami-parts-bridge-fetch-napa-minicart',
+          cartCode: code,
+          sponsorPk: resolveSponsorPk(),
+          cartApiPrefix: lastCartApiPrefix,
+          generation: miniCartGeneration
+        },
+        '*'
+      );
+      return true;
+    } catch {
+      void pushCartUpdate(true);
+      return false;
+    }
   }
 
   function requestMiniCartRefresh() {
@@ -382,31 +425,61 @@
       return false;
     }
 
-    void fetchMiniCart(cartCode).catch(() => {
-      try {
-        window.postMessage(
-          {
-            source: 'ami-parts-bridge-fetch-napa-minicart',
-            cartCode,
-            sponsorPk: resolveSponsorPk()
-          },
-          '*'
-        );
-      } catch {
-        void pushCartUpdate(true);
+    // Coalesce the refresh storm (ATC + click + page + retries) into one call.
+    if (pendingRefreshTimer) window.clearTimeout(pendingRefreshTimer);
+    pendingRefreshTimer = window.setTimeout(() => {
+      pendingRefreshTimer = null;
+      if (refreshInFlight) {
+        refreshQueuedAgain = true;
+        return;
       }
-    });
+      refreshInFlight = true;
+      refreshQueuedAgain = false;
+      miniCartGeneration += 1;
+      void fetchMiniCart(resolveCartCode()).finally(() => {
+        window.setTimeout(() => {
+          refreshInFlight = false;
+          if (refreshQueuedAgain) {
+            refreshQueuedAgain = false;
+            requestMiniCartRefresh();
+          }
+        }, 700);
+      });
+    }, 400);
     return true;
   }
 
-  function ingestPayload(payload, sourceHint, kind, method) {
+  function entryCountHint(data, lines) {
+    const totalHint =
+      Number(data?.totalItems) ||
+      Number(data?.totalUnitCount) ||
+      Number(data?.deliveryItemsQuantity) ||
+      0;
+    if (totalHint > 0) return Math.max(lines.length, totalHint);
+    return lines.length;
+  }
+
+  function shouldAllowMiniCartShrink(lines, data) {
+    const isEmpty =
+      lines.length === 0 &&
+      (Number(data?.totalItems) === 0 ||
+        Number(data?.totalUnitCount) === 0 ||
+        (Array.isArray(data?.entries) && data.entries.length === 0));
+    if (isEmpty) return true;
+    if (Date.now() - lastRemoveAt < 4000) return true;
+    return false;
+  }
+
+  function ingestPayload(payload, sourceHint, kind, method, meta) {
     if (payload == null) return;
     if (kind === 'request') {
       rememberSponsorPk(sourceHint);
+      rememberCartApiFromUrl(sourceHint);
       return;
     }
 
     rememberSponsorPk(sourceHint);
+    rememberCartApiFromUrl(sourceHint);
 
     let data = payload;
     if (typeof payload === 'string') {
@@ -429,22 +502,30 @@
 
     if (data?.code) rememberCartCode(data.code);
 
+    // Ignore stale page-world refresh responses when a newer refresh was queued.
+    const responseGen = Number(meta?.generation);
+    if (
+      Number.isFinite(responseGen) &&
+      responseGen > 0 &&
+      responseGen < miniCartGeneration
+    ) {
+      return;
+    }
+
     // getMiniCart is the only authoritative full-cart replace (incl. empty after removals).
     // Do NOT treat every payload with `entries` as a full snapshot — ProLink ATC /
     // entry-mutation responses often include a partial `entries` array, which used
     // to wipe the extension cart down to a single line.
     if (isNapaMiniCartUrl(sourceHint)) {
       const lines = extractNapaCartLines(data);
-      // Ignore stale mini-cart responses that arrive after a newer ATC merge and
-      // would shrink the cart (common race when multiple refreshes are in flight).
-      const msSinceAtc = Date.now() - lastAtcAt;
-      if (
-        lastAtcAt > 0 &&
-        msSinceAtc < 2000 &&
-        lines.length > 0 &&
-        lines.length < networkLines.length
-      ) {
-        window.setTimeout(() => requestMiniCartRefresh(), 400);
+      const shrinks =
+        lines.length > 0 && lines.length < networkLines.length;
+      if (shrinks && !shouldAllowMiniCartShrink(lines, data)) {
+        // Stale/wrong-cart snapshot (network log showed 2.3KB vs 2.8KB races).
+        // Keep the fuller cart; optionally retry once after ATC.
+        if (Date.now() - lastAtcAt < 5000) {
+          window.setTimeout(() => requestMiniCartRefresh(), 600);
+        }
         return;
       }
       applyCartLines(lines, { replace: true });
@@ -465,25 +546,23 @@
     // Quantity update / remove (product=…&quantity=0) — refresh mini-cart.
     // Do not apply partial `entries` from these responses as a full replace.
     if (isNapaEntriesMutationUrl(sourceHint)) {
+      if (/[?&]quantity=0(?:&|$)/i.test(String(sourceHint || ''))) {
+        lastRemoveAt = Date.now();
+      }
       window.setTimeout(() => requestMiniCartRefresh(), 250);
-      window.setTimeout(() => requestMiniCartRefresh(), 900);
       return;
     }
 
     // Other cart payloads with entries (e.g. non-miniCart cart GETs):
     // only replace when the snapshot is at least as complete as what we have;
     // otherwise merge and refresh so partial responses cannot shrink the cart.
-    if (Array.isArray(data?.entries)) {
+    if (Array.isArray(data?.entries) || Array.isArray(data?.cart?.entries)) {
       const lines = extractNapaCartLines(data);
-      const totalHint =
-        Number(data.totalItems) ||
-        Number(data.totalUnitCount) ||
-        Number(data.deliveryItemsQuantity) ||
-        0;
+      const totalHint = entryCountHint(data, lines);
       const looksComplete =
         lines.length >= networkLines.length ||
         (totalHint > 0 && lines.length >= totalHint) ||
-        (lines.length === 0 && totalHint === 0 && Array.isArray(data.entries));
+        (lines.length === 0 && totalHint === 0);
 
       if (looksComplete) {
         applyCartLines(lines, { replace: true });
@@ -517,7 +596,9 @@
       if (event.source !== window) return;
       const data = event.data;
       if (!data || data.source !== 'ami-parts-bridge-network') return;
-      ingestPayload(data.body, data.url, data.kind, data.method);
+      ingestPayload(data.body, data.url, data.kind, data.method, {
+        generation: data.generation
+      });
     });
   }
 
@@ -531,6 +612,7 @@
   function resetCart() {
     networkLines = [];
     lastSentSignature = '';
+    lastRemoveAt = Date.now();
     void pushCartUpdate(true);
   }
 
@@ -611,8 +693,8 @@
         }
       }
       if (looksLikeRemove) {
-        window.setTimeout(() => requestMiniCartRefresh(), 400);
-        window.setTimeout(() => requestMiniCartRefresh(), 1200);
+        lastRemoveAt = Date.now();
+        window.setTimeout(() => requestMiniCartRefresh(), 500);
       }
     },
     true
@@ -657,9 +739,19 @@
     const nextSig = JSON.stringify(
       nextLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
     );
-    if (nextSig !== lastSentSignature) {
-      networkLines = nextLines.map((line) => ({ ...line }));
-      lastSentSignature = nextSig;
+    if (nextSig === lastSentSignature) return;
+
+    // Ignore out-of-order storage writes that shrink the cart (stale push race).
+    if (
+      nextLines.length > 0 &&
+      nextLines.length < networkLines.length &&
+      Date.now() - lastRemoveAt >= 4000
+    ) {
+      void pushCartUpdate(true);
+      return;
     }
+
+    networkLines = nextLines.map((line) => ({ ...line }));
+    lastSentSignature = nextSig;
   });
 })();

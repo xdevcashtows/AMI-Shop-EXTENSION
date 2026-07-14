@@ -93,6 +93,9 @@
     }
   }
 
+  // Capture native fetch before patching so our own refreshes can avoid double-emit.
+  const origFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+
   /** Page-context fetch so FirstCall session cookies / CSRF apply. */
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
@@ -113,7 +116,8 @@
       const token = csrfToken() || lastCsrfFromHeader;
       if (token) headers['x-csrf-token'] = token;
 
-      fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
+      const doFetch = origFetch || fetch.bind(window);
+      doFetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
         .then((response) => response.text().then((text) => ({ response, text })))
         .then(({ response, text }) => {
           emit(response.url || url, text, 'response', 'GET');
@@ -133,29 +137,61 @@
       const params = new URLSearchParams({ fields: 'DEFAULT' });
       const sponsorPk = String(data.sponsorPk || '').trim();
       if (sponsorPk) params.set('sponsorPK', sponsorPk);
-      const url = `/occ/v2/prolinkus/users/current/carts/${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
+      const prefixRaw = String(data.cartApiPrefix || '').trim();
+      const prefix = /^\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\/$/i.test(
+        prefixRaw
+      )
+        ? prefixRaw
+        : '/occ/v2/prolinkus/users/current/carts/';
+      const url = `${prefix}${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
       const headers = {
         Accept: 'application/json',
         'Content-Type': 'application/json'
       };
+      const generation = Number(data.generation) || 0;
 
-      fetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
+      // Use origFetch so our own refresh is not re-emitted as a page cart event
+      // (avoids double-ingest). Emit once with the generation token.
+      const doFetch = origFetch || fetch.bind(window);
+      doFetch(url, { method: 'GET', credentials: 'include', headers, cache: 'no-store' })
         .then((response) => response.text().then((text) => ({ response, text })))
         .then(({ response, text }) => {
-          emit(response.url || url, text, 'response', 'GET');
+          try {
+            window.postMessage(
+              {
+                source: SOURCE,
+                url: String(response.url || url),
+                body: text,
+                kind: 'response',
+                method: 'GET',
+                generation
+              },
+              '*'
+            );
+          } catch (_) {
+            // ignore
+          }
         })
         .catch(() => {
-          emit(
-            url,
-            JSON.stringify({ code: cartCode, entries: [], totalItems: 0 }),
-            'response',
-            'GET'
-          );
+          try {
+            window.postMessage(
+              {
+                source: SOURCE,
+                url,
+                body: JSON.stringify({ code: cartCode, entries: [], totalItems: 0 }),
+                kind: 'response',
+                method: 'GET',
+                generation
+              },
+              '*'
+            );
+          } catch (_) {
+            // ignore
+          }
         });
     }
   });
 
-  const origFetch = window.fetch;
   if (typeof origFetch === 'function') {
     window.fetch = async function (...args) {
       let method = 'GET';
