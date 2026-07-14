@@ -243,12 +243,93 @@
    */
   function findCartEntriesArray(data) {
     if (!data || typeof data !== 'object') return null;
+    if (Array.isArray(data)) return data;
     if (Array.isArray(data.entries)) return data.entries;
     if (Array.isArray(data.cart?.entries)) return data.cart.entries;
+    if (Array.isArray(data.miniCart?.entries)) return data.miniCart.entries;
     if (Array.isArray(data.miniCartEntries)) return data.miniCartEntries;
     if (Array.isArray(data.orderEntries)) return data.orderEntries;
     if (Array.isArray(data.entryList)) return data.entryList;
+    if (Array.isArray(data.items)) return data.items;
+    if (Array.isArray(data.products)) return data.products;
     return null;
+  }
+
+  /**
+   * ProLink writes the live header cart to localStorage key "mini-cart".
+   * That is the simplest source of truth — mirror it 1:1 into Shop Cart.
+   */
+  function extractLocalStorageMiniCartLines(raw) {
+    if (raw == null) return [];
+    let data = raw;
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return [];
+      try {
+        data = JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+    }
+    if (data == null) return [];
+    if (typeof data === 'string') {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        return null;
+      }
+    }
+
+    let lines = extractMiniCartLines(data);
+    if (lines != null) return lines;
+
+    // Redux-persist / nested wrappers sometimes bury entries deeper.
+    lines = extractGraphqlCartLines(data);
+    if (lines != null) return lines;
+
+    // Empty cart object with no entries array.
+    if (typeof data === 'object' && !Array.isArray(data)) {
+      const entries = findCartEntriesArray(data);
+      if (entries && entries.length === 0) return [];
+      if (
+        Number(data.totalItems || data.totalUnitCount || data.cartCount || 0) === 0 &&
+        !findCartEntriesArray(data)
+      ) {
+        return [];
+      }
+    }
+    return null;
+  }
+
+  function applyLocalStorageMiniCart(raw) {
+    const lines = extractLocalStorageMiniCartLines(raw);
+    if (lines == null) return false;
+    const signature = JSON.stringify(
+      lines.map((l) => [l.partNumber, l.description, l.quantity, l.cost, l.externalId])
+    );
+    const currentSig = JSON.stringify(
+      networkLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost, l.externalId])
+    );
+    lastAppliedMiniCartStart = Date.now();
+    if (signature === currentSig && signature === lastSentSignature) {
+      return true;
+    }
+    applyCartLines(lines, { replace: true });
+    return true;
+  }
+
+  function readLocalStorageMiniCart() {
+    try {
+      return window.localStorage.getItem('mini-cart');
+    } catch {
+      return null;
+    }
+  }
+
+  function syncFromLocalStorageMiniCart() {
+    const raw = readLocalStorageMiniCart();
+    if (raw == null) return false;
+    return applyLocalStorageMiniCart(raw);
   }
 
   function extractMiniCartLines(data) {
@@ -325,9 +406,14 @@
     });
   }
 
+  function isLocalStorageMiniCartSource(sourceHint) {
+    return /localstorage:mini-cart/i.test(String(sourceHint || ''));
+  }
+
   function isNapaCartUrl(sourceHint) {
     const hint = String(sourceHint || '').toLowerCase();
     return (
+      isLocalStorageMiniCartSource(hint) ||
       /\/occ\/v2\/[^/]+\/(?:org)?users\/current\/carts\//i.test(hint) ||
       /\/carts\/[^/]+\/getminicart/i.test(hint) ||
       /\/entries\/multi\/atc/i.test(hint) ||
@@ -591,6 +677,17 @@
     rememberSponsorPk(sourceHint);
     rememberCartApiFromUrl(sourceHint);
 
+    // Primary sync path: ProLink's own mini-cart localStorage mirror.
+    if (isLocalStorageMiniCartSource(sourceHint)) {
+      if (typeof payload === 'string' && !payload.trim()) {
+        lastAppliedMiniCartStart = Date.now();
+        applyCartLines([], { replace: true });
+        return;
+      }
+      applyLocalStorageMiniCart(payload);
+      return;
+    }
+
     const status = Number(meta?.status);
     if (Number.isFinite(status) && status >= 400) {
       return;
@@ -618,18 +715,23 @@
     if (data?.code) rememberCartCode(data.code);
 
     // On page load ProLink often hydrates the saved cart via GraphQL only.
+    // Prefer localStorage when present; otherwise use GraphQL as a fallback.
     if (/graphql/i.test(String(sourceHint || ''))) {
+      if (syncFromLocalStorageMiniCart()) return;
       const lines = extractGraphqlCartLines(data);
       if (lines && lines.length) {
         applyCartLines(lines, { replace: true });
-        // Follow up with OCC mini-cart once cart code / headers are warm.
         window.setTimeout(() => requestMiniCartRefresh(), 400);
       }
       return;
     }
 
-    // getMiniCart = source of truth. Always full-replace from `entries`.
+    // getMiniCart backup — only if localStorage did not already win.
     if (isNapaMiniCartUrl(sourceHint)) {
+      if (readLocalStorageMiniCart() != null) {
+        syncFromLocalStorageMiniCart();
+        return;
+      }
       queueMiniCartSnapshot(data, status, meta?.requestStartedAt);
       return;
     }
@@ -737,10 +839,21 @@
   rememberSponsorPk(window.location.href);
   readCartCodeFromCookie();
 
-  // Saved NAPA carts hydrate over GraphQL on first paint — also pull OCC mini-cart
-  // after the page session/headers are ready so Shop Cart matches on open.
-  window.setTimeout(() => requestMiniCartRefresh(), 1200);
-  window.setTimeout(() => requestMiniCartRefresh(), 3000);
+  // Mirror ProLink mini-cart localStorage immediately + poll as a safety net
+  // (same-tab storage events do not fire; setItem hook covers most writes).
+  syncFromLocalStorageMiniCart();
+  window.setTimeout(() => syncFromLocalStorageMiniCart(), 500);
+  window.setTimeout(() => syncFromLocalStorageMiniCart(), 1500);
+  window.setTimeout(() => syncFromLocalStorageMiniCart(), 3500);
+  window.setInterval(() => {
+    if (dead) return;
+    syncFromLocalStorageMiniCart();
+  }, 1000);
+
+  // Network getMiniCart remains a backup when localStorage is empty/missing.
+  window.setTimeout(() => {
+    if (!readLocalStorageMiniCart()) requestMiniCartRefresh();
+  }, 2000);
 
   window.__amiTryFillVin = tryFillVin;
 
@@ -760,6 +873,7 @@
   });
 
   window.addEventListener('ami-parts-bridge-scrape-now', () => {
+    if (syncFromLocalStorageMiniCart()) return;
     if (!requestMiniCartRefresh()) {
       void pushCartUpdate(true);
     }
@@ -806,15 +920,17 @@
       return true;
     }
     if (message?.type === 'AMI_SCRAPE_NOW') {
-      const started = requestMiniCartRefresh();
+      const fromStorage = syncFromLocalStorageMiniCart();
+      const started = fromStorage ? false : requestMiniCartRefresh();
       window.setTimeout(() => {
         sendResponse({
           ok: true,
-          started,
+          started: fromStorage || started,
           cartCode: resolveCartCode() || null,
-          lines: scrapeCartLines()
+          lines: scrapeCartLines(),
+          source: fromStorage ? 'localStorage:mini-cart' : 'network'
         });
-      }, 900);
+      }, fromStorage ? 50 : 900);
       return true;
     }
     if (message?.type === 'AMI_SESSION_UPDATED' && message.resetCart) {
