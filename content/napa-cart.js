@@ -15,10 +15,12 @@
    * ProLink uses orgUsers (not users) — wrong prefix causes getMiniCart 404s.
    */
   let lastCartApiPrefix = '/occ/v2/prolinkus/orgUsers/current/carts/';
-  /** @type {{ data: any, status: number } | null} */
+  /** @type {{ data: any, status: number, started: number, lineCount: number } | null} */
   let pendingMiniCart = null;
   /** @type {ReturnType<typeof setTimeout> | null} */
   let pendingMiniCartTimer = null;
+  /** Only apply getMiniCart responses from requests started at/after this time. */
+  let lastAppliedMiniCartStart = 0;
   let dead = false;
 
   function markDead() {
@@ -239,6 +241,16 @@
    * Never use cartModifications here — those are partial ATC leftovers and
    * were collapsing a 3-line mini-cart down to 1 line.
    */
+  function findCartEntriesArray(data) {
+    if (!data || typeof data !== 'object') return null;
+    if (Array.isArray(data.entries)) return data.entries;
+    if (Array.isArray(data.cart?.entries)) return data.cart.entries;
+    if (Array.isArray(data.miniCartEntries)) return data.miniCartEntries;
+    if (Array.isArray(data.orderEntries)) return data.orderEntries;
+    if (Array.isArray(data.entryList)) return data.entryList;
+    return null;
+  }
+
   function extractMiniCartLines(data) {
     /** @type {Map<string, any>} */
     const map = new Map();
@@ -271,10 +283,7 @@
       data?.cart && typeof data.cart === 'object' ? data.cart : null;
     if (nestedCart?.code) rememberCartCode(nestedCart.code);
 
-    const entries =
-      (Array.isArray(data?.entries) && data.entries) ||
-      (Array.isArray(nestedCart?.entries) && nestedCart.entries) ||
-      null;
+    const entries = findCartEntriesArray(data);
     if (!entries) return null;
     entries.forEach((entry) => push(entry));
     return Array.from(map.values());
@@ -446,18 +455,42 @@
   }
 
   /**
-   * Coalesce burst getMiniCart responses; apply only the latest after a short
-   * delay so an older smaller snapshot cannot win a race.
+   * Coalesce parallel getMiniCart responses. Prefer the newest *request*
+   * (by requestStartedAt), not whichever response finished last — an older
+   * in-flight 1-line snapshot was overwriting a newer 3-line cart.
    */
-  function queueMiniCartSnapshot(data, status) {
-    pendingMiniCart = { data, status: Number(status) || 200 };
+  function queueMiniCartSnapshot(data, status, requestStartedAt) {
+    const lines = extractMiniCartLines(data);
+    if (lines == null) return;
+
+    const started = Number(requestStartedAt);
+    const startedAt = Number.isFinite(started) && started > 0 ? started : Date.now();
+    if (startedAt < lastAppliedMiniCartStart) return;
+
+    if (
+      !pendingMiniCart ||
+      startedAt > pendingMiniCart.started ||
+      (startedAt === pendingMiniCart.started &&
+        lines.length >= pendingMiniCart.lineCount)
+    ) {
+      pendingMiniCart = {
+        data,
+        status: Number(status) || 200,
+        started: startedAt,
+        lineCount: lines.length
+      };
+    }
+
     if (pendingMiniCartTimer) window.clearTimeout(pendingMiniCartTimer);
     pendingMiniCartTimer = window.setTimeout(() => {
       pendingMiniCartTimer = null;
       const snap = pendingMiniCart;
       pendingMiniCart = null;
-      if (snap) applyMiniCartSnapshot(snap.data, snap.status);
-    }, 120);
+      if (!snap) return;
+      if (snap.started < lastAppliedMiniCartStart) return;
+      lastAppliedMiniCartStart = snap.started;
+      applyMiniCartSnapshot(snap.data, snap.status);
+    }, 180);
   }
 
   function ingestPayload(payload, sourceHint, kind, method, meta) {
@@ -499,7 +532,7 @@
 
     // getMiniCart = source of truth. Always full-replace from `entries`.
     if (isNapaMiniCartUrl(sourceHint)) {
-      queueMiniCartSnapshot(data, status);
+      queueMiniCartSnapshot(data, status, meta?.requestStartedAt);
       return;
     }
 
@@ -527,10 +560,7 @@
     }
 
     // ATC: optimistic merge of the newly added line(s) only.
-    if (
-      isNapaAtcUrl(sourceHint) ||
-      (Array.isArray(data?.cartModifications) && data.cartModifications.length)
-    ) {
+    if (isNapaAtcUrl(sourceHint)) {
       const lines = extractAtcLines(data);
       if (lines.length) applyCartLines(lines, { replace: false });
       return;
@@ -562,7 +592,8 @@
       if (!data || data.source !== 'ami-parts-bridge-network') return;
       ingestPayload(data.body, data.url, data.kind, data.method, {
         generation: data.generation,
-        status: data.status
+        status: data.status,
+        requestStartedAt: data.requestStartedAt
       });
     });
   }

@@ -98,6 +98,10 @@
   // Capture native fetch before patching so our own refreshes can avoid double-emit.
   const origFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
 
+  function isMiniCartUrl(url) {
+    return /getminicart/i.test(String(url || ''));
+  }
+
   /** Page-context fetch so FirstCall session cookies / CSRF apply. */
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
@@ -173,6 +177,7 @@
     window.fetch = async function (...args) {
       let method = 'GET';
       let url = '';
+      const requestStartedAt = Date.now();
       try {
         const input = args[0];
         const init = args[1] || {};
@@ -209,10 +214,13 @@
           typeof args[0] === 'string'
             ? args[0]
             : (args[0] && args[0].url) || url;
+        const extra = isMiniCartUrl(responseUrl) || isMiniCartUrl(url)
+          ? { requestStartedAt }
+          : undefined;
         clone
           .text()
           .then((text) =>
-            emit(responseUrl, text, 'response', method, response.status)
+            emit(responseUrl, text, 'response', method, response.status, extra)
           )
           .catch(() => {});
       } catch (_) {
@@ -230,6 +238,7 @@
     OrigXHR.prototype.open = function (method, url, ...rest) {
       this.__amiUrl = url;
       this.__amiMethod = method;
+      this.__amiStartedAt = Date.now();
       return open.call(this, method, url, ...rest);
     };
     OrigXHR.prototype.setRequestHeader = function (name, value) {
@@ -253,12 +262,17 @@
       }
       this.addEventListener('load', function () {
         try {
+          const url = this.__amiUrl || '';
+          const extra = isMiniCartUrl(url)
+            ? { requestStartedAt: this.__amiStartedAt || Date.now() }
+            : undefined;
           emit(
-            this.__amiUrl || '',
+            url,
             this.responseText || '',
             'response',
             String(this.__amiMethod || 'GET').toUpperCase(),
-            this.status
+            this.status,
+            extra
           );
         } catch (_) {
           // ignore
