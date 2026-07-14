@@ -143,7 +143,7 @@
         prefixRaw
       )
         ? prefixRaw
-        : '/occ/v2/prolinkus/users/current/carts/';
+        : '/occ/v2/prolinkus/orgUsers/current/carts/';
       const url = `${prefix}${encodeURIComponent(cartCode)}/getMiniCart?${params.toString()}`;
       const headers = {
         Accept: 'application/json',

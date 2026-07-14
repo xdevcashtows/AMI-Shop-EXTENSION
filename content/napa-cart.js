@@ -11,11 +11,10 @@
   /** @type {string} */
   let lastSponsorPk = '';
   /**
-   * OCC cart path prefix from the page's own getMiniCart URL
-   * (e.g. /occ/v2/prolinkus/users/current/carts/ or .../orgUsers/...).
-   * Must match what ProLink uses or refreshes can hit a different/stale cart.
+   * OCC cart path prefix from the page's own cart URL.
+   * ProLink uses orgUsers (not users) — wrong prefix causes getMiniCart 404s.
    */
-  let lastCartApiPrefix = '/occ/v2/prolinkus/users/current/carts/';
+  let lastCartApiPrefix = '/occ/v2/prolinkus/orgUsers/current/carts/';
   /** Timestamp of last successful ATC merge. */
   let lastAtcAt = 0;
   /** Timestamp of last remove/clear intent (allows mini-cart to shrink). */
@@ -463,7 +462,11 @@
     // Only allow a non-empty smaller snapshot after an intentional remove.
     // Empty clears are handled separately with stricter 200-OK checks so
     // getMiniCart 404 bodies cannot wipe the cart.
-    if (lines.length > 0 && Date.now() - lastRemoveAt < 8000) return true;
+    if (lines.length === 0) return false;
+    // After a fresh ATC, never shrink — a stale 1-line mini-cart was wiping
+    // the just-merged second item (especially after remove → re-add).
+    if (Date.now() - lastAtcAt < 8000) return false;
+    if (Date.now() - lastRemoveAt < 8000) return true;
     return false;
   }
 
@@ -625,6 +628,9 @@
       if (lines.length) {
         applyCartLines(lines, { replace: false });
         lastAtcAt = Date.now();
+        // Close the post-remove shrink window so a stale mini-cart cannot
+        // undo this merge (ATC only returns the newly added line).
+        lastRemoveAt = 0;
       }
       window.setTimeout(() => requestMiniCartRefresh(), 250);
       return;
