@@ -518,10 +518,47 @@
     }
   }
 
+  function stripBridgeHashFromUrl() {
+    try {
+      const url = new URL(window.location.href);
+      const hash = url.hash.replace(/^#/, '');
+      if (
+        !hash ||
+        (!hash.includes('ami-bridge=') && !hash.includes('ami_ts='))
+      ) {
+        return;
+      }
+      const cleaned = hash
+        .split('&')
+        .filter(
+          (part) =>
+            part &&
+            !part.startsWith('ami-bridge=') &&
+            !part.startsWith('ami_ts=')
+        )
+        .join('&');
+      url.hash = cleaned;
+      window.history.replaceState(
+        null,
+        '',
+        url.toString().replace(/#$/, '')
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   function applySessionFromLaunchUrl() {
     if (!ensureAlive()) return;
     const payload = parseBridgePayloadFromHash();
-    if (!payload) return;
+    if (!payload) {
+      // Still strip foreign ami_* fragments (e.g. NAPA ProLink reload loops).
+      stripBridgeHashFromUrl();
+      return;
+    }
+
+    // Strip immediately — waiting for AMI_SET_SESSION lets NAPA fight the hash.
+    stripBridgeHashFromUrl();
 
     void Ami.sendMessage({
       type: 'AMI_SET_SESSION',
@@ -546,21 +583,6 @@
       window.dispatchEvent(new CustomEvent('ami-parts-bridge-reset-cart'));
       showWidget();
       notifyWidgetStatus('Shop cart ready for this job', 'ok');
-      // Clean the handshake out of the URL so refresh doesn't re-apply forever.
-      try {
-        const url = new URL(window.location.href);
-        const hash = url.hash.replace(/^#/, '');
-        if (hash.includes('ami-bridge=')) {
-          const cleaned = hash
-            .split('&')
-            .filter((part) => part && !part.startsWith('ami-bridge='))
-            .join('&');
-          url.hash = cleaned;
-          window.history.replaceState(null, '', url.toString());
-        }
-      } catch {
-        // ignore
-      }
     });
   }
 
