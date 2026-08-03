@@ -6,13 +6,6 @@ const STORAGE_KEYS = {
 
 const DEFAULT_API_BASE = 'http://localhost:8787';
 
-function showWidgetOnTab(tabId) {
-  if (tabId == null) return;
-  chrome.tabs.sendMessage(tabId, { type: 'AMI_SHOW_WIDGET' }, () => {
-    void chrome.runtime.lastError;
-  });
-}
-
 function isOreillyUrl(url) {
   if (!url) return false;
   return (
@@ -30,25 +23,88 @@ function isSupplierUrl(url) {
   return isOreillyUrl(url) || isNapaUrl(url);
 }
 
-function showWidgetOnSupplierTabs() {
+function querySupplierTabs() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({}, (tabs) => {
+      resolve(
+        (tabs || []).filter((tab) => tab.id != null && isSupplierUrl(tab.url || ''))
+      );
+    });
+  });
+}
+
+async function findSupplierTabId(preferredTabId) {
+  if (preferredTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(preferredTabId);
+      if (tab?.id != null && isSupplierUrl(tab.url || '')) return tab.id;
+    } catch {
+      // fall through
+    }
+  }
+
+  const supplierTabs = await querySupplierTabs();
+  if (!supplierTabs.length) return null;
+
+  const active = supplierTabs.find((tab) => tab.active);
+  return (active || supplierTabs[0]).id ?? null;
+}
+
+function openSidePanelForTab(tabId) {
+  if (tabId == null || !chrome.sidePanel?.open) return;
+  try {
+    void chrome.sidePanel.open({ tabId }).catch(() => {
+      // May require a user gesture; toolbar icon still opens the panel.
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function openSidePanelOnSupplierTabs(preferredTabId) {
+  const tabId = await findSupplierTabId(preferredTabId);
+  if (tabId != null) {
+    openSidePanelForTab(tabId);
+    return;
+  }
+  const supplierTabs = await querySupplierTabs();
+  for (const tab of supplierTabs) {
+    openSidePanelForTab(tab.id);
+  }
+}
+
+function notifySupplierTabs(message) {
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
-      if (!tab.id || !tab.url) continue;
-      if (isSupplierUrl(tab.url)) showWidgetOnTab(tab.id);
+      if (!tab.id || !isSupplierUrl(tab.url || '')) continue;
+      chrome.tabs.sendMessage(tab.id, message, () => {
+        void chrome.runtime.lastError;
+      });
     }
   });
 }
 
-chrome.action.onClicked.addListener((tab) => {
-  if (tab?.id == null) return;
-  if (!isSupplierUrl(tab.url || '')) {
-    // Widget only lives on O'Reilly / FirstCall / NAPA ProLink pages.
-    return;
-  }
-  chrome.tabs.sendMessage(tab.id, { type: 'AMI_TOGGLE_WIDGET' }, () => {
-    void chrome.runtime.lastError;
+function sendToSupplierTab(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({
+          ok: false,
+          error: chrome.runtime.lastError.message || 'Supplier tab not ready'
+        });
+        return;
+      }
+      resolve(response ?? { ok: true });
+    });
   });
-});
+}
+
+// Open the native side panel when the toolbar icon is clicked.
+try {
+  void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+} catch {
+  // ignore
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return;
@@ -104,24 +160,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             [STORAGE_KEYS.pendingLines]: sameSession ? pending : []
           },
           () => {
-            showWidgetOnSupplierTabs();
-            // Also push session to open supplier tabs explicitly.
-            chrome.tabs.query({}, (tabs) => {
-              for (const tab of tabs) {
-                if (!tab.id || !isSupplierUrl(tab.url || '')) continue;
-                chrome.tabs.sendMessage(
-                  tab.id,
-                  {
-                    type: 'AMI_SESSION_UPDATED',
-                    session: next,
-                    resetCart: !sameSession
-                  },
-                  () => {
-                    void chrome.runtime.lastError;
-                  }
-                );
-              }
+            notifySupplierTabs({
+              type: 'AMI_SESSION_UPDATED',
+              session: next,
+              resetCart: !sameSession
             });
+            void openSidePanelOnSupplierTabs(sender.tab?.id);
             sendResponse({ ok: true, session: next });
           }
         );
@@ -244,28 +288,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'AMI_SHOW_WIDGET') {
-    showWidgetOnSupplierTabs();
-    sendResponse({ ok: true });
-    return;
+    void openSidePanelOnSupplierTabs(sender.tab?.id);
+    sendResponse({ ok: true, sidePanel: true });
+    return true;
   }
 
-  // Widget Refresh → content script re-fetches supplier cart snapshot.
-  if (message.type === 'AMI_SCRAPE_NOW') {
-    const tabId = sender.tab?.id;
-    if (tabId == null) {
-      sendResponse({ ok: false, error: 'No tab for scrape' });
-      return;
-    }
-    chrome.tabs.sendMessage(tabId, { type: 'AMI_SCRAPE_NOW' }, (response) => {
-      if (chrome.runtime.lastError) {
+  if (message.type === 'AMI_FILL_VIN') {
+    void (async () => {
+      const tabId = await findSupplierTabId(sender.tab?.id);
+      if (tabId == null) {
         sendResponse({
           ok: false,
-          error: chrome.runtime.lastError.message || 'Scrape failed'
+          error: 'Open a NAPA or O\'Reilly tab first'
         });
         return;
       }
-      sendResponse(response ?? { ok: true });
-    });
+      sendResponse(await sendToSupplierTab(tabId, { type: 'AMI_FILL_VIN' }));
+    })();
+    return true;
+  }
+
+  // Side panel Refresh → content script re-fetches supplier cart snapshot.
+  if (message.type === 'AMI_SCRAPE_NOW') {
+    void (async () => {
+      const tabId = await findSupplierTabId(sender.tab?.id);
+      if (tabId == null) {
+        sendResponse({
+          ok: false,
+          error: 'Open a NAPA or O\'Reilly tab first'
+        });
+        return;
+      }
+      // Ping cart scripts + supplier-bridge (both listen for AMI_SCRAPE_NOW).
+      sendResponse(await sendToSupplierTab(tabId, { type: 'AMI_SCRAPE_NOW' }));
+    })();
     return true;
   }
 });

@@ -52,6 +52,7 @@ const els = {
   vehicleLabel: document.getElementById('vehicleLabel'),
   copyVinBtn: document.getElementById('copyVinBtn'),
   fillVinBtn: document.getElementById('fillVinBtn'),
+  refreshBtn: document.getElementById('refreshBtn'),
   cartEmpty: document.getElementById('cartEmpty'),
   cartCount: document.getElementById('cartCount'),
   cartTable: document.getElementById('cartTable'),
@@ -255,14 +256,6 @@ async function removeLine(index) {
   );
 }
 
-function postToParent(type, payload) {
-  try {
-    window.parent.postMessage({ source: 'ami-parts-bridge-widget', type, ...payload }, '*');
-  } catch {
-    // ignore
-  }
-}
-
 els.copyVinBtn.addEventListener('click', async () => {
   const vin = currentSession?.vehicle?.vin;
   if (!vin) return;
@@ -274,10 +267,39 @@ els.copyVinBtn.addEventListener('click', async () => {
   }
 });
 
-els.fillVinBtn.addEventListener('click', () => {
-  postToParent('AMI_WIDGET_FILL_VIN');
-  setStatus('Requested VIN fill on this page…');
+els.fillVinBtn.addEventListener('click', async () => {
+  setStatus('Requested VIN fill on supplier page…');
+  const response = await sendMessage({ type: 'AMI_FILL_VIN' });
+  if (response?.ok === false || response?.error) {
+    setStatus(response?.error || 'Could not fill VIN', 'err');
+    return;
+  }
+  setStatus(response?.message || 'VIN filled on page', 'ok');
 });
+
+if (els.refreshBtn) {
+  els.refreshBtn.addEventListener('click', async () => {
+    setStatus('Refreshing cart…');
+    const response = await sendMessage({ type: 'AMI_SCRAPE_NOW' });
+    if (response?.ok === false && response.error) {
+      setStatus(response.error, 'err');
+    }
+    window.setTimeout(() => void load(), 600);
+    window.setTimeout(() => void load(), 1400);
+    window.setTimeout(async () => {
+      await load();
+      const count = Array.isArray(currentSession?.lines)
+        ? currentSession.lines.length
+        : 0;
+      setStatus(
+        count
+          ? `Cart refreshed · ${count} part${count === 1 ? '' : 's'}`
+          : 'Cart refreshed · empty',
+        'ok'
+      );
+    }, 2200);
+  });
+}
 
 els.clearBtn.addEventListener('click', async () => {
   const response = await sendMessage({ type: 'AMI_CLEAR_SESSION' });
@@ -333,13 +355,5 @@ try {
 } catch {
   // ignore
 }
-
-window.addEventListener('message', (event) => {
-  const data = event.data;
-  if (!data || data.source !== 'ami-parts-bridge-host') return;
-  if (data.type === 'AMI_HOST_STATUS') {
-    setStatus(data.text || '', data.kind);
-  }
-});
 
 void load();

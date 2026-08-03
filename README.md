@@ -1,8 +1,8 @@
 # AMI Parts Bridge Extension
 
-Floating browser widget that mirrors an O'Reilly FirstCall or NAPA ProLink cart and transfers selected parts into an **AMI Shop CRM** job card.
+Chrome **side panel** that mirrors an O'Reilly FirstCall or NAPA ProLink cart and transfers selected parts into an **AMI Shop CRM** job card.
 
-The widget is **not** a Chrome side panel — it floats over the page, can be dragged, collapsed, or closed, and remembers its position.
+The UI lives in Chrome's native side panel beside the page -- it does **not** overlay or cover the supplier site.
 
 ## Install (Chrome / Edge)
 
@@ -14,34 +14,34 @@ The widget is **not** a Chrome side panel — it floats over the page, can be dr
 
 ## Use
 
-1. Run AMI Shop CRM (`npm run dev:all`).
-2. Open a job card → **Order from O'Reilly** or **Order from NAPA**.
-3. The supplier site opens; the floating **AMI Parts Bridge** widget appears **only on the supplier page** (not in AMI CRM).
-4. Drag the navy title bar to move it. Drag any edge/corner to resize. Use **▾** to collapse, **✕** to hide.
+1. Run AMI Shop CRM (`npm run dev:all`) or use production shop.
+2. Open a job card -> **Order from O'Reilly** or **Order from NAPA**.
+3. The supplier site opens; the **AMI Parts Bridge** side panel opens beside it (or click the toolbar icon).
+4. Collapse/close the panel with Chrome's side panel controls -- the supplier page stays fully visible.
 5. Shop / build a quote. Use **Copy VIN** / **Fill VIN** as needed.
-6. Click **Transfer to Job Card** — parts are imported into AMI automatically.
-
-Click the extension toolbar icon anytime to toggle the widget on the current tab.
+6. Click **Transfer to Job Card** -- parts are imported into AMI automatically.
 
 ### Verify without scraping
 
-In the widget, click **Add test** → **Transfer to Job Card**.
+If your panel build includes **Add test**, use that then **Transfer to Job Card**. Otherwise add a real part on the supplier site and transfer.
 
 ## Project layout
 
 ```
-background.js                 Session storage + transfer POST
+background.js                 Session storage + transfer POST + side panel open
+sidepanel/                    Side panel UI (reuses widget assets)
 content/crm-bridge.js         CRM session handoff + extension ping
+content/supplier-bridge.js    Hash handshake + Fill VIN / scrape relay
 content/oreilly-cart.js       FirstCall cart mirror + VIN fill
 content/napa-cart.js          NAPA ProLink cart mirror + VIN fill
+content/napa-hash-strip.js    Early NAPA #ami-bridge strip
 content/page-network-hook.js  Page-world fetch/XHR intercept
-content/floating-widget.js    Draggable floating host + iframe
-widget/                       Widget UI (loaded inside the iframe)
+widget/                       Shared panel UI assets
 icons/
 ```
 
 ## Notes
 
-- Position is saved in extension storage.
-- API base URL defaults to `http://localhost:8787` (editable under API settings in the widget).
+- API base URL can be set in extension storage (`amiPartsBridgeSettings.apiBaseUrl`); default is `http://localhost:8787`.
 - NAPA cart sync watches ProLink `atc` / `getMiniCart` / cart `entries` APIs.
+- Toolbar icon opens/closes the Chrome side panel.

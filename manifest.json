@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.3.3",
-  "description": "Floating widget that mirrors NAPA / O'Reilly quote carts and transfers parts into AMI Shop CRM job cards.",
-  "permissions": ["storage", "tabs"],
+  "version": "0.3.4",
+  "description": "Chrome side panel that mirrors NAPA / O'Reilly quote carts and transfers parts into AMI Shop CRM job cards.",
+  "permissions": ["storage", "tabs", "sidePanel"],
   "host_permissions": [
     "http://localhost:5173/*",
     "http://localhost:8787/*",
@@ -21,11 +21,14 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "AMI Parts Bridge — toggle floating widget"
+    "default_title": "AMI Parts Bridge - open side panel"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
   },
   "web_accessible_resources": [
     {
-      "resources": ["widget/*", "icons/*", "content/page-network-hook.js"],
+      "resources": ["icons/*", "content/page-network-hook.js"],
       "matches": [
         "https://www.firstcallonline.com/*",
         "https://firstcallonline.com/*",
@@ -56,7 +59,7 @@
       "js": [
         "content/safe-chrome.js",
         "content/oreilly-cart.js",
-        "content/floating-widget.js"
+        "content/supplier-bridge.js"
       ],
       "run_at": "document_start"
     },
@@ -69,7 +72,7 @@
         "content/safe-chrome.js",
         "content/napa-hash-strip.js",
         "content/napa-cart.js",
-        "content/floating-widget.js"
+        "content/supplier-bridge.js"
       ],
       "run_at": "document_start"
     }
