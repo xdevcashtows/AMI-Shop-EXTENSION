@@ -123,6 +123,7 @@
           jobNumber: detail.jobNumber,
           vehicle: detail.vehicle || {},
           crmOrigin: detail.crmOrigin || window.location.origin,
+          apiBaseUrl: detail.apiBaseUrl,
           lines: []
         }
       }).then((response) => {

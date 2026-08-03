@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Floating widget that mirrors NAPA / O'Reilly quote carts and transfers parts into AMI Shop CRM job cards.",
   "permissions": ["storage", "tabs"],
   "host_permissions": [
@@ -9,6 +9,7 @@
     "http://localhost:8787/*",
     "http://127.0.0.1:5173/*",
     "http://127.0.0.1:8787/*",
+    "https://shop.amitowing.com/*",
     "https://www.firstcallonline.com/*",
     "https://firstcallonline.com/*",
     "https://*.firstcallonline.com/*",
@@ -39,7 +40,8 @@
     {
       "matches": [
         "http://localhost:5173/*",
-        "http://127.0.0.1:5173/*"
+        "http://127.0.0.1:5173/*",
+        "https://shop.amitowing.com/*"
       ],
       "js": ["content/safe-chrome.js", "content/crm-bridge.js"],
       "run_at": "document_idle"
@@ -65,6 +67,7 @@
       ],
       "js": [
         "content/safe-chrome.js",
+        "content/napa-hash-strip.js",
         "content/napa-cart.js",
         "content/floating-widget.js"
       ],
