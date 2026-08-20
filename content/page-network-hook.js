@@ -5,7 +5,410 @@
   const SOURCE = 'ami-parts-bridge-network';
   const FETCH_SOURCE = 'ami-parts-bridge-fetch-miniquote';
   const NAPA_FETCH_SOURCE = 'ami-parts-bridge-fetch-napa-minicart';
+  const WEBEST_GRID_SOURCE = 'ami-parts-bridge-read-webest-grid';
+  const WEBEST_DELETE_SOURCE = 'ami-parts-bridge-webest-delete';
+  const WEBEST_FILL_VIN_SOURCE = 'ami-parts-bridge-webest-fill-vin';
   const DEFAULT_NAPA_CART_PREFIX = '/occ/v2/prolinkus/users/current/carts/';
+
+  /** @type {Record<string, string>} */
+  let lastWebEstHeaders = {};
+  /** @type {string} */
+  let lastWebEstActionUrl = '';
+
+  function stripJsonKeyArray(text, key) {
+    const raw = String(text || '');
+    const needle = `"${key}"`;
+    const idx = raw.indexOf(needle);
+    if (idx < 0) return raw;
+    const colon = raw.indexOf(':', idx + needle.length);
+    if (colon < 0) return raw;
+    let i = colon + 1;
+    while (i < raw.length && /\s/.test(raw[i])) i += 1;
+    if (raw[i] !== '[') return raw;
+    let depth = 0;
+    const start = i;
+    for (; i < raw.length; i += 1) {
+      const ch = raw[i];
+      if (ch === '[') depth += 1;
+      else if (ch === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          return raw.slice(0, start) + '[]' + raw.slice(i + 1);
+        }
+      } else if (ch === '"') {
+        i += 1;
+        while (i < raw.length) {
+          if (raw[i] === '\\') {
+            i += 2;
+            continue;
+          }
+          if (raw[i] === '"') break;
+          i += 1;
+        }
+      }
+    }
+    return raw;
+  }
+
+  function slimPartRow(part) {
+    if (!part || typeof part !== 'object') return part;
+    const copy = {};
+    const skip = {
+      Images: true,
+      AftermarketPartOptions: true,
+      Base64Img: true,
+      hotspot: true,
+      image: true
+    };
+    Object.keys(part).forEach((key) => {
+      if (skip[key]) return;
+      const value = part[key];
+      if (typeof value === 'string' && value.length > 20000) return;
+      copy[key] = value;
+    });
+    return copy;
+  }
+
+  function parseMaybeJson(body) {
+    if (body && typeof body === 'object') return body;
+    if (typeof body !== 'string') return null;
+    let raw = body.trim();
+    if (!raw) return null;
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+    const start = raw.search(/[{\[]/);
+    if (start < 0) return null;
+    if (start > 0) raw = raw.slice(start);
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      try {
+        return JSON.parse(stripJsonKeyArray(raw, 'Images'));
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  function slimSectionData(data, extra) {
+    const parts = Array.isArray(data.Parts) ? data.Parts.map(slimPartRow) : [];
+    const sectionId =
+      data.SectionID ??
+      data.sectionID ??
+      parts.find((part) => part && part.SectionID != null)?.SectionID;
+    const out = {
+      Parts: parts,
+      Success: data.Success !== false,
+      ErrorMessage: data.ErrorMessage || '',
+      SectionID: sectionId
+    };
+    if (data.FullEstimate || (extra && extra.FullEstimate)) {
+      out.FullEstimate = true;
+    }
+    if (data.PreserveLabor || (extra && extra.PreserveLabor)) {
+      out.PreserveLabor = true;
+    }
+    if (extra && typeof extra === 'object') {
+      Object.keys(extra).forEach((key) => {
+        if (key === 'FullEstimate' || key === 'PreserveLabor') return;
+        out[key] = extra[key];
+      });
+    }
+    return JSON.stringify(out);
+  }
+
+  function slimWebEstBody(url, body, kind) {
+    if (kind !== 'response') return body;
+    const u = String(url || '');
+    const isSection = /GetSectionData/i.test(u);
+    const isEstimateApi =
+      isSection ||
+      /SaveEstimateLine|DeleteEstimateLine|GetLinePreview/i.test(u);
+    if (!isEstimateApi) return body;
+
+    const data = parseMaybeJson(body);
+    if (!data || typeof data !== 'object') {
+      if (typeof body === 'string' && isSection) {
+        return stripJsonKeyArray(body, 'Images');
+      }
+      return body;
+    }
+    if (Array.isArray(data.Parts)) return slimSectionData(data);
+    const copy = { ...data };
+    delete copy.Images;
+    delete copy.AftermarketPartOptions;
+    try {
+      return JSON.stringify(copy);
+    } catch (_) {
+      return body;
+    }
+  }
+
+  function xhrResponseBody(xhr) {
+    const type = String(xhr.responseType || '');
+    if (type === 'json') {
+      try {
+        return xhr.response;
+      } catch (_) {
+        return '';
+      }
+    }
+    try {
+      if (xhr.responseText) return xhr.responseText;
+    } catch (_) {
+      // responseType json/blob throws on responseText
+    }
+    try {
+      return xhr.response != null ? xhr.response : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function prepareEmitBody(url, body, kind) {
+    return slimWebEstBody(url, body, kind);
+  }
+
+  function isWebEstEstimateUrl(url) {
+    return /GetSectionData|SaveEstimateLine|DeleteEstimateLine|GetLinePreview/i.test(
+      String(url || '')
+    );
+  }
+
+  function isSyntheticWebEstUrl(url) {
+    const value = String(url || '');
+    return (
+      value === '/Estimate/GetSectionData' ||
+      /\/Estimate\/GetManualEntryList/i.test(value)
+    );
+  }
+
+  function rememberWebEstActionUrl(url) {
+    const value = String(url || '').split('?')[0];
+    if (!value || isSyntheticWebEstUrl(value) || !isWebEstEstimateUrl(value)) {
+      return;
+    }
+    lastWebEstActionUrl = value;
+  }
+
+  function estimatePathPrefix() {
+    const match = window.location.pathname.match(/^(\/\d+\/estimate\/\d+)/i);
+    return match ? match[1] : '';
+  }
+
+  function shopPathPrefix() {
+    const match = window.location.pathname.match(/^(\/\d+)/);
+    return match ? match[1] : '';
+  }
+
+  function siblingWebEstActionUrl(url, action) {
+    const value = String(url || '').split('?')[0];
+    if (
+      !value ||
+      !/GetSectionData|SaveEstimateLine|DeleteEstimateLine|GetLinePreview/i.test(
+        value
+      )
+    ) {
+      return '';
+    }
+    return value.replace(
+      /GetSectionData|SaveEstimateLine|DeleteEstimateLine|GetLinePreview/i,
+      action
+    );
+  }
+
+  function deleteUrlCandidates(preferred) {
+    /** @type {string[]} */
+    const urls = [];
+    const add = (value) => {
+      const next = String(value || '').trim();
+      if (!next || urls.includes(next)) return;
+      urls.push(next);
+    };
+    add(preferred);
+    add(siblingWebEstActionUrl(lastWebEstActionUrl, 'DeleteEstimateLine'));
+    const estimatePrefix = estimatePathPrefix();
+    if (estimatePrefix) add(`${estimatePrefix}/DeleteEstimateLine`);
+    const shop = shopPathPrefix();
+    if (shop) add(`${shop}/Estimate/DeleteEstimateLine`);
+    add('/Estimate/DeleteEstimateLine');
+    return urls;
+  }
+
+  function rowLaborScore(row) {
+    if (!row || typeof row !== 'object') return 0;
+    const keys = ['RRTime', 'RITime', 'PaintTime', 'LaborTime'];
+    let total = 0;
+    for (let i = 0; i < keys.length; i += 1) {
+      const value = Number(row[keys[i]]);
+      if (Number.isFinite(value) && value > 0) total += value;
+    }
+    return total;
+  }
+
+  function laborTextFromRowEl(tr) {
+    if (!tr || !tr.querySelectorAll) return '';
+    const cells = tr.querySelectorAll('td');
+    let best = '';
+    for (let i = 0; i < cells.length; i += 1) {
+      const text = String(cells[i].innerText || cells[i].textContent || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!/\d+(?:\.\d+)?\s*hrs?\.?/i.test(text)) continue;
+      if (text.length > best.length) best = text;
+    }
+    return best;
+  }
+
+  function collectVisibleLaborRows() {
+    /** @type {any[]} */
+    const rows = [];
+    const jq = window.jQuery || window.$;
+    if (jq && typeof jq === 'function') {
+      jq('.k-grid').each(function () {
+        const grid = jq(this).data('kendoGrid');
+        if (!grid) return;
+        jq(this)
+          .find('.k-grid-content tbody tr, .k-grid-content-locked tbody tr, table tbody tr')
+          .each(function () {
+            const labor = laborTextFromRowEl(this);
+            if (!labor) return;
+            let json = {};
+            try {
+              const item = grid.dataItem && grid.dataItem(this);
+              json = item && typeof item.toJSON === 'function' ? item.toJSON() : item || {};
+            } catch (_) {
+              json = {};
+            }
+            rows.push({
+              ...json,
+              LaborItems: labor,
+              Labor: labor
+            });
+          });
+      });
+    }
+    document.querySelectorAll('table').forEach((table) => {
+      const headerEls = table.querySelectorAll('thead th, thead td');
+      if (!headerEls.length) return;
+      const headers = [];
+      headerEls.forEach((cell) => {
+        headers.push(
+          String(cell.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase()
+        );
+      });
+      const pnIdx = headers.findIndex((h) => h.includes('part number'));
+      const laborIdx = headers.findIndex((h) => h === 'labor' || h.startsWith('labor'));
+      const nameIdx = headers.findIndex(
+        (h) => h.includes('part name') || h.includes('description')
+      );
+      const priceIdx = headers.findIndex((h) => h.includes('price'));
+      if (pnIdx < 0 && laborIdx < 0) return;
+      table.querySelectorAll('tbody tr').forEach((tr) => {
+        const cells = tr.querySelectorAll('td');
+        const partNumber =
+          pnIdx >= 0 ? String(cells[pnIdx]?.textContent || '').trim() : '';
+        const labor =
+          laborIdx >= 0
+            ? String(cells[laborIdx]?.innerText || cells[laborIdx]?.textContent || '')
+                .replace(/\u00a0/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+            : laborTextFromRowEl(tr);
+        const description =
+          nameIdx >= 0
+            ? String(cells[nameIdx]?.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+            : '';
+        if (!partNumber && !description) return;
+        if (!labor && !partNumber) return;
+        rows.push({
+          PartNumber: partNumber,
+          Description: description,
+          Price:
+            priceIdx >= 0 ? String(cells[priceIdx]?.textContent || '') : '',
+          LaborItems: labor,
+          Labor: labor
+        });
+      });
+    });
+    return rows;
+  }
+
+  function laborDisplayText(row) {
+    if (!row || typeof row !== 'object') return '';
+    const value =
+      row.LaborItems ?? row.laborItems ?? row.Labor ?? row.labor ?? '';
+    if (typeof value === 'string') return value.trim();
+    if (value == null) return '';
+    return String(value).trim();
+  }
+
+  function attachLaborDisplay(parts, estimateRows) {
+    if (!Array.isArray(parts) || !Array.isArray(estimateRows) || !estimateRows.length) {
+      return parts;
+    }
+    /** @type {Record<string, string>} */
+    const byId = {};
+    /** @type {Record<string, string>} */
+    const byPn = {};
+    estimateRows.forEach((row) => {
+      const text = laborDisplayText(row);
+      if (!text || !/\d+(?:\.\d+)?\s*hrs?\.?/i.test(text)) return;
+      const id = Number(row.EstimateLineID ?? row.ID ?? 0);
+      const pn = String(row.PartNumber || row.partNumber || '').trim();
+      if (id > 0 && (!byId[String(id)] || text.length > byId[String(id)].length)) {
+        byId[String(id)] = text;
+      }
+      if (pn && (!byPn[pn] || text.length > byPn[pn].length)) {
+        byPn[pn] = text;
+      }
+    });
+    return parts.map((part) => {
+      const id = String(part.EstimateLineID ?? part.ID ?? '');
+      const pn = String(part.PartNumber || part.partNumber || '').trim();
+      const text = byId[id] || byPn[pn];
+      if (!text) return part;
+      return { ...part, LaborItems: text };
+    });
+  }
+
+  function rememberWebEstHeaders(headers, url) {
+    if (!headers || !isWebEstEstimateUrl(url)) return;
+    try {
+      /** @type {Record<string, string>} */
+      const next = {};
+      const keep = [
+        'accept',
+        'content-type',
+        'requestverificationtoken',
+        'x-requested-with'
+      ];
+      const read = (name) => {
+        if (typeof headers.get === 'function') return headers.get(name);
+        if (typeof headers === 'object') {
+          const found = Object.keys(headers).find(
+            (k) => k.toLowerCase() === name.toLowerCase()
+          );
+          return found ? headers[found] : null;
+        }
+        return null;
+      };
+      keep.forEach((name) => {
+        const value = read(name);
+        if (value) next[name] = String(value);
+      });
+      if (Object.keys(next).length) {
+        lastWebEstHeaders = { ...lastWebEstHeaders, ...next };
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
 
   function emit(url, body, kind, method, status, extra) {
     try {
@@ -13,7 +416,7 @@
         {
           source: SOURCE,
           url: String(url || ''),
-          body,
+          body: prepareEmitBody(url, body, kind),
           kind: kind || 'response',
           method: method || '',
           status: status == null ? undefined : Number(status),
@@ -225,6 +628,235 @@
         .catch(() => {
           // Ignore network failures; keep the last known good cart.
         });
+      return;
+    }
+
+    if (data.source === WEBEST_GRID_SOURCE) {
+      try {
+        const jq = window.jQuery || window.$;
+        const gridRows = (grid) => {
+          if (!grid || !grid.dataSource || typeof grid.dataSource.data !== 'function') {
+            return [];
+          }
+          const dataItems = grid.dataSource.data();
+          const rows = [];
+          for (let i = 0; i < dataItems.length; i += 1) {
+            const item = dataItems[i];
+            rows.push(
+              item && typeof item.toJSON === 'function' ? item.toJSON() : item
+            );
+          }
+          return rows;
+        };
+
+        const manualGrid =
+          jq && typeof jq === 'function'
+            ? jq('#manualentrylistitem-grid').data('kendoGrid')
+            : null;
+        if (
+          data.refresh &&
+          manualGrid &&
+          manualGrid.dataSource &&
+          typeof manualGrid.dataSource.read === 'function'
+        ) {
+          manualGrid.dataSource.read();
+          return;
+        }
+
+        let bestFull = null;
+        let bestMixed = null;
+        if (jq && typeof jq === 'function') {
+          jq('.k-grid').each(function () {
+            const grid = jq(this).data('kendoGrid');
+            const rows = gridRows(grid);
+            if (!rows.length) return;
+            const onEstimate = rows.filter(
+              (row) => Number(row?.EstimateLineID ?? row?.ID ?? 0) > 0
+            );
+            if (!onEstimate.length) return;
+            if (onEstimate.length === rows.length) {
+              if (!bestFull || onEstimate.length >= bestFull.length) {
+                bestFull = onEstimate;
+              }
+              return;
+            }
+            if (!bestMixed || rows.length > bestMixed.length) {
+              bestMixed = rows;
+            }
+          });
+        }
+
+        const visibleLabor = collectVisibleLaborRows();
+
+        if (bestMixed && bestMixed.length) {
+          emit(
+            '/Estimate/GetSectionData',
+            slimSectionData({
+              Parts: attachLaborDisplay(bestMixed, [
+                ...(bestFull || []),
+                ...visibleLabor
+              ]),
+              Success: true
+            }),
+            'response',
+            'GET',
+            200
+          );
+          return;
+        }
+        if (bestFull && bestFull.length) {
+          const withLabor = attachLaborDisplay(bestFull, visibleLabor);
+          const hasLabor =
+            withLabor.some((row) => rowLaborScore(row) > 0) ||
+            withLabor.some((row) => laborDisplayText(row));
+          emit(
+            '/Estimate/GetSectionData',
+            slimSectionData(
+              { Parts: withLabor, Success: true },
+              { FullEstimate: true, PreserveLabor: !hasLabor }
+            ),
+            'response',
+            'GET',
+            200
+          );
+          return;
+        }
+        if (visibleLabor.length) {
+          const usable = visibleLabor.filter(
+            (row) => Number(row.EstimateLineID ?? row.ID ?? 0) > 0
+          );
+          if (usable.length) {
+            emit(
+              '/Estimate/GetSectionData',
+              slimSectionData(
+                { Parts: usable, Success: true },
+                { FullEstimate: true }
+              ),
+              'response',
+              'GET',
+              200
+            );
+          }
+          return;
+        }
+
+        const rows = gridRows(manualGrid);
+        if (!rows.length) return;
+        emit(
+          '/Estimate/GetManualEntryList',
+          JSON.stringify({ Data: rows, Total: rows.length }),
+          'response',
+          'GET',
+          200
+        );
+      } catch (_) {
+        // Keep the last known good estimate lines.
+      }
+      return;
+    }
+
+    if (data.source === WEBEST_DELETE_SOURCE) {
+      const url = String(data.url || '');
+      const body = data.body == null ? '' : String(data.body);
+      const contentType = String(data.contentType || 'application/json');
+      const requestId = data.requestId;
+      const headers = {
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': contentType,
+        'X-Requested-With': 'XMLHttpRequest',
+        ...lastWebEstHeaders
+      };
+      try {
+        const tokenInput = document.querySelector(
+          'input[name="__RequestVerificationToken"]'
+        );
+        if (
+          tokenInput instanceof HTMLInputElement &&
+          tokenInput.value &&
+          !headers.RequestVerificationToken &&
+          !headers.requestverificationtoken
+        ) {
+          headers.RequestVerificationToken = tokenInput.value;
+        }
+      } catch (_) {
+        // ignore
+      }
+      const doFetch = origFetch || fetch.bind(window);
+      const urls = deleteUrlCandidates(url);
+      void (async () => {
+        let lastStatus = 0;
+        let lastText = '';
+        let lastUrl = urls[0] || url;
+        for (let i = 0; i < urls.length; i += 1) {
+          const candidate = urls[i];
+          try {
+            const response = await doFetch(candidate, {
+              method: 'POST',
+              credentials: 'include',
+              headers,
+              body,
+              cache: 'no-store'
+            });
+            const text = await response.text();
+            lastStatus = response.status;
+            lastText = text;
+            lastUrl = response.url || candidate;
+            if (response.status !== 404 && response.status !== 405) break;
+          } catch (_) {
+            lastStatus = 0;
+            lastText = JSON.stringify({
+              Success: false,
+              ErrorMessage: 'Could not delete estimate line'
+            });
+            lastUrl = candidate;
+          }
+        }
+        emit(lastUrl, lastText, 'response', 'POST', lastStatus, {
+          webestDelete: true,
+          requestId
+        });
+      })();
+      return;
+    }
+
+    if (data.source === WEBEST_FILL_VIN_SOURCE) {
+      const vin = String(data.vin || '').trim();
+      if (!vin) return;
+      try {
+        const nodes = document.querySelectorAll('input, textarea');
+        /** @type {HTMLInputElement | HTMLTextAreaElement | null} */
+        let input = null;
+        nodes.forEach((node) => {
+          if (input) return;
+          if (
+            !(node instanceof HTMLInputElement) &&
+            !(node instanceof HTMLTextAreaElement)
+          ) {
+            return;
+          }
+          const hay = `${node.name} ${node.id} ${node.placeholder} ${
+            node.getAttribute('aria-label') || ''
+          }`.toLowerCase();
+          if (hay.includes('vin')) input = node;
+        });
+        if (!input) return;
+        input.focus();
+        input.value = vin;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        const jq = window.jQuery || window.$;
+        if (jq) {
+          const $el = jq(input);
+          ['kendoMaskedTextBox', 'kendoTextBox', 'kendoComboBox'].forEach(
+            (name) => {
+              const widget = $el.data(name);
+              if (widget && typeof widget.value === 'function') widget.value(vin);
+            }
+          );
+        }
+      } catch (_) {
+        // ignore
+      }
     }
   });
 
@@ -251,6 +883,8 @@
               if (token) lastCsrfFromHeader = String(token);
             }
             rememberNapaCartHeaders(hdrs, url);
+            rememberWebEstHeaders(hdrs, url);
+            rememberWebEstActionUrl(url);
           }
         } catch (_) {
           // ignore
@@ -305,6 +939,8 @@
         if (String(name).toLowerCase() === 'x-csrf-token' && value) {
           lastCsrfFromHeader = String(value);
         }
+        if (!this.__amiHeaders) this.__amiHeaders = {};
+        this.__amiHeaders[String(name)] = String(value);
       } catch (_) {
         // ignore
       }
@@ -313,6 +949,8 @@
     OrigXHR.prototype.send = function (...args) {
       try {
         const method = String(this.__amiMethod || 'GET').toUpperCase();
+        rememberWebEstHeaders(this.__amiHeaders, this.__amiUrl || '');
+        rememberWebEstActionUrl(this.__amiUrl || '');
         if (method !== 'GET' && method !== 'HEAD' && args[0] != null) {
           emit(this.__amiUrl || '', bodyToText(args[0]), 'request', method);
         }
@@ -327,7 +965,7 @@
             : undefined;
           emit(
             url,
-            this.responseText || '',
+            xhrResponseBody(this),
             'response',
             String(this.__amiMethod || 'GET').toUpperCase(),
             this.status,
@@ -339,5 +977,52 @@
       });
       return send.apply(this, args);
     };
+  }
+
+  function hookKendoSectionData() {
+    try {
+      const kendo = window.kendo;
+      const proto =
+        kendo &&
+        kendo.data &&
+        kendo.data.DataSource &&
+        kendo.data.DataSource.prototype;
+      if (!proto || proto.__amiPartsBridgeHooked) return Boolean(proto);
+      proto.__amiPartsBridgeHooked = true;
+      const origTrigger = proto.trigger;
+      proto.trigger = function (eventName, eventData) {
+        try {
+          if (String(eventName) === 'requestEnd' && eventData && eventData.response) {
+            const resp = eventData.response;
+            if (resp && Array.isArray(resp.Parts)) {
+              emit(
+                '/Estimate/GetSectionData',
+                slimSectionData(resp),
+                'response',
+                'GET',
+                200
+              );
+            }
+          }
+        } catch (_) {
+          // ignore
+        }
+        return origTrigger.apply(this, arguments);
+      };
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  if (!hookKendoSectionData()) {
+    window.addEventListener('DOMContentLoaded', hookKendoSectionData, {
+      once: true
+    });
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries += 1;
+      if (hookKendoSectionData() || tries > 40) window.clearInterval(timer);
+    }, 250);
   }
 })();

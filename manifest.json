@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.3.4",
-  "description": "Chrome side panel that mirrors NAPA / O'Reilly quote carts and transfers parts into AMI Shop CRM job cards.",
+  "version": "0.3.10",
+  "description": "Chrome side panel that mirrors NAPA / O'Reilly carts and WebEst estimate lines, then transfers them into AMI Shop CRM job cards.",
   "permissions": ["storage", "tabs", "sidePanel"],
   "host_permissions": [
     "http://localhost:5173/*",
@@ -15,7 +15,9 @@
     "https://*.firstcallonline.com/*",
     "https://*.oreillyauto.com/*",
     "https://pro.napaprolink.com/*",
-    "https://*.napaprolink.com/*"
+    "https://*.napaprolink.com/*",
+    "https://proestimator.web-est.com/*",
+    "https://*.web-est.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -35,7 +37,9 @@
         "https://*.firstcallonline.com/*",
         "https://*.oreillyauto.com/*",
         "https://pro.napaprolink.com/*",
-        "https://*.napaprolink.com/*"
+        "https://*.napaprolink.com/*",
+        "https://proestimator.web-est.com/*",
+        "https://*.web-est.com/*"
       ]
     }
   ],
@@ -75,6 +79,29 @@
         "content/supplier-bridge.js"
       ],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://proestimator.web-est.com/*",
+        "https://*.web-est.com/*"
+      ],
+      "js": ["content/page-network-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://proestimator.web-est.com/*",
+        "https://*.web-est.com/*"
+      ],
+      "js": [
+        "content/safe-chrome.js",
+        "content/webest-cart.js",
+        "content/supplier-bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
     }
   ],
   "icons": {

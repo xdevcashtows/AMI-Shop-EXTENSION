@@ -57,6 +57,7 @@ const els = {
   cartCount: document.getElementById('cartCount'),
   cartTable: document.getElementById('cartTable'),
   cartBody: document.getElementById('cartBody'),
+  hoursColHeader: document.getElementById('hoursColHeader'),
   status: document.getElementById('status'),
   clearBtn: document.getElementById('clearBtn'),
   transferBtn: document.getElementById('transferBtn')
@@ -108,6 +109,21 @@ function setCartCount(count) {
   }
 }
 
+function supplierDisplayName(supplier, long) {
+  if (supplier === 'napa') return long ? 'NAPA ProLink' : 'NAPA';
+  if (supplier === 'webest') return 'WebEst';
+  return long ? "O'Reilly / FirstCall" : "O'Reilly";
+}
+
+function isLaborOnlyLine(line) {
+  return (
+    line?.lineKind === 'labor' ||
+    (!String(line?.partNumber || '').trim() &&
+      !(Number(line?.cost) > 0) &&
+      Number(line?.laborHours) > 0)
+  );
+}
+
 function render() {
   const session = currentSession;
   if (!session) {
@@ -118,8 +134,10 @@ function render() {
     els.vehicleLabel.innerHTML = '—';
     els.copyVinBtn.disabled = true;
     els.fillVinBtn.disabled = true;
+    els.fillVinBtn.classList.remove('hidden');
     els.transferBtn.disabled = true;
     setCartCount(0);
+    els.hoursColHeader?.classList.add('hidden');
     els.cartEmpty.classList.remove('hidden');
     els.cartEmpty.innerHTML = `
       <span class="empty-title">No active session</span>
@@ -130,7 +148,8 @@ function render() {
     return;
   }
 
-  const supplierLabel = session.supplier === 'napa' ? 'NAPA' : "O'Reilly";
+  const supplierLabel = supplierDisplayName(session.supplier, false);
+  const isWebEst = session.supplier === 'webest';
   els.subtitle.textContent = 'Shop, then transfer when ready';
   els.supplierBadge.textContent = supplierLabel;
   els.supplierBadge.classList.remove('hidden');
@@ -142,18 +161,25 @@ function render() {
   els.ymmLabel.textContent = ymmText(session.vehicle);
   els.vehicleLabel.innerHTML = renderVinHtml(session.vehicle);
   els.copyVinBtn.disabled = !session.vehicle?.vin;
-  els.fillVinBtn.disabled = false;
+  els.fillVinBtn.classList.remove('hidden');
+  els.fillVinBtn.disabled = !session.vehicle?.vin;
 
   const lines = Array.isArray(session.lines) ? session.lines : [];
+  const showHours =
+    isWebEst || lines.some((line) => Number(line?.laborHours) > 0);
+  els.hoursColHeader?.classList.toggle('hidden', !showHours);
   els.transferBtn.disabled = lines.length === 0;
   setCartCount(lines.length);
 
   if (!lines.length) {
     els.cartEmpty.classList.remove('hidden');
-    const supplierName = session.supplier === 'napa' ? 'NAPA ProLink' : "O'Reilly";
+    const supplierName = supplierDisplayName(session.supplier, true);
+    const emptyHint = isWebEst
+      ? `Add parts to the ${supplierName} estimate and they’ll show up here.`
+      : `Add parts to your ${supplierName} cart and they’ll show up here.`;
     els.cartEmpty.innerHTML = `
-      <span class="empty-title">Cart is empty</span>
-      <span class="empty-hint">Add parts to your ${supplierName} cart and they’ll show up here.</span>
+      <span class="empty-title">${isWebEst ? 'No estimate lines' : 'Cart is empty'}</span>
+      <span class="empty-hint">${emptyHint}</span>
     `;
     els.cartTable.classList.add('hidden');
     els.cartBody.innerHTML = '';
@@ -164,40 +190,52 @@ function render() {
   els.cartTable.classList.remove('hidden');
   els.cartBody.innerHTML = '';
   lines.forEach((line, index) => {
+    const laborOnly = isLaborOnlyLine(line);
+    const label = laborOnly
+      ? String(line.laborCategory || line.description || '').trim()
+      : String(line.description || '');
+    const hours =
+      Number.isFinite(Number(line.laborHours)) && Number(line.laborHours) > 0
+        ? String(line.laborHours)
+        : '—';
+    const hoursTitle = line.laborCategory
+      ? `${hours} hrs · ${line.laborCategory}`
+      : `${hours} hrs`;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="part-cell">${escapeHtml(line.partNumber || '—')}</td>
-      <td class="desc-cell" title="${escapeHtml(line.description || '')}">${escapeHtml(line.description || '')}</td>
+      <td class="desc-cell" title="${escapeHtml(label)}">${escapeHtml(label)}</td>
       <td class="qty-cell num"></td>
-      <td class="cost-cell">${money(line.cost)}</td>
-      <td class="actions-col"></td>
+      ${
+        showHours
+          ? `<td class="hours-cell num" title="${escapeHtml(hoursTitle)}">${escapeHtml(hours)}</td>`
+          : ''
+      }
+      <td class="cost-cell">${laborOnly ? '—' : money(line.cost)}</td>
     `;
 
-    const qtyInput = document.createElement('input');
-    qtyInput.type = 'number';
-    qtyInput.className = 'qty-input';
-    qtyInput.min = '1';
-    qtyInput.step = '1';
-    qtyInput.value = String(Math.max(1, Number(line.quantity) || 1));
-    qtyInput.title = 'Edit quantity';
-    qtyInput.setAttribute('aria-label', `Quantity for ${line.partNumber || 'part'}`);
-    qtyInput.addEventListener('change', () => void updateQuantity(index, qtyInput.value));
-    qtyInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        qtyInput.blur();
-      }
-    });
-    tr.querySelector('.qty-cell')?.appendChild(qtyInput);
+    const qtyCell = tr.querySelector('.qty-cell');
+    if (laborOnly) {
+      if (qtyCell) qtyCell.textContent = '—';
+    } else {
+      const qtyInput = document.createElement('input');
+      qtyInput.type = 'number';
+      qtyInput.className = 'qty-input';
+      qtyInput.min = '1';
+      qtyInput.step = '1';
+      qtyInput.value = String(Math.max(1, Number(line.quantity) || 1));
+      qtyInput.title = 'Edit quantity';
+      qtyInput.setAttribute('aria-label', `Quantity for ${line.partNumber || 'part'}`);
+      qtyInput.addEventListener('change', () => void updateQuantity(index, qtyInput.value));
+      qtyInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          qtyInput.blur();
+        }
+      });
+      qtyCell?.appendChild(qtyInput);
+    }
 
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'btn icon-danger';
-    removeBtn.textContent = '✕';
-    removeBtn.title = 'Remove';
-    removeBtn.setAttribute('aria-label', `Remove ${line.partNumber || 'part'}`);
-    removeBtn.addEventListener('click', () => void removeLine(index));
-    tr.lastElementChild.appendChild(removeBtn);
     els.cartBody.appendChild(tr);
   });
 }
@@ -246,16 +284,6 @@ async function updateQuantity(index, rawValue) {
   await persistLines(lines, `Quantity updated to ${qty}`);
 }
 
-async function removeLine(index) {
-  if (!currentSession) return;
-  const lines = [...(currentSession.lines || [])];
-  lines.splice(index, 1);
-  await persistLines(
-    lines,
-    lines.length ? 'Part removed from shop cart' : 'Shop cart cleared'
-  );
-}
-
 els.copyVinBtn.addEventListener('click', async () => {
   const vin = currentSession?.vehicle?.vin;
   if (!vin) return;
@@ -291,10 +319,11 @@ if (els.refreshBtn) {
       const count = Array.isArray(currentSession?.lines)
         ? currentSession.lines.length
         : 0;
+      const isWebEst = currentSession?.supplier === 'webest';
       setStatus(
         count
-          ? `Cart refreshed · ${count} part${count === 1 ? '' : 's'}`
-          : 'Cart refreshed · empty',
+          ? `${isWebEst ? 'Estimate' : 'Cart'} refreshed · ${count} line${count === 1 ? '' : 's'}`
+          : `${isWebEst ? 'Estimate' : 'Cart'} refreshed · empty`,
         'ok'
       );
     }, 2200);

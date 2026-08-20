@@ -19,8 +19,28 @@ function isNapaUrl(url) {
   return url.includes('napaprolink.com');
 }
 
+function isWebEstUrl(url) {
+  if (!url) return false;
+  return url.includes('web-est.com');
+}
+
 function isSupplierUrl(url) {
-  return isOreillyUrl(url) || isNapaUrl(url);
+  return isOreillyUrl(url) || isNapaUrl(url) || isWebEstUrl(url);
+}
+
+function urlMatchesSupplier(url, supplier) {
+  if (supplier === 'napa') return isNapaUrl(url);
+  if (supplier === 'webest') return isWebEstUrl(url);
+  if (supplier === 'oreilly') return isOreillyUrl(url);
+  return isSupplierUrl(url);
+}
+
+function getStoredSession() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([STORAGE_KEYS.session], (result) => {
+      resolve(result[STORAGE_KEYS.session] || null);
+    });
+  });
 }
 
 function querySupplierTabs() {
@@ -46,8 +66,13 @@ async function findSupplierTabId(preferredTabId) {
   const supplierTabs = await querySupplierTabs();
   if (!supplierTabs.length) return null;
 
-  const active = supplierTabs.find((tab) => tab.active);
-  return (active || supplierTabs[0]).id ?? null;
+  const session = await getStoredSession();
+  const matching = session?.supplier
+    ? supplierTabs.filter((tab) => urlMatchesSupplier(tab.url || '', session.supplier))
+    : supplierTabs;
+  const pool = matching.length ? matching : supplierTabs;
+  const active = pool.find((tab) => tab.active);
+  return (active || pool[0]).id ?? null;
 }
 
 function openSidePanelForTab(tabId) {
@@ -299,11 +324,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: 'Open a NAPA or O\'Reilly tab first'
+          error: 'Open a NAPA, O\'Reilly, or WebEst tab first'
         });
         return;
       }
       sendResponse(await sendToSupplierTab(tabId, { type: 'AMI_FILL_VIN' }));
+    })();
+    return true;
+  }
+
+  if (message.type === 'AMI_REMOVE_ESTIMATE_LINE') {
+    void (async () => {
+      const tabId = await findSupplierTabId(sender.tab?.id);
+      if (tabId == null) {
+        sendResponse({
+          ok: false,
+          error: 'Open a WebEst tab first'
+        });
+        return;
+      }
+      const result = await sendToSupplierTab(tabId, {
+        type: 'AMI_REMOVE_ESTIMATE_LINE',
+        externalId: message.externalId,
+        estimateLineId: message.estimateLineId
+      });
+      if (result?.ok && Array.isArray(result.lines)) {
+        const stored = await getStoredSession();
+        if (stored) {
+          const next = {
+            ...stored,
+            lines: result.lines,
+            updatedAt: new Date().toISOString()
+          };
+          chrome.storage.local.set({ [STORAGE_KEYS.session]: next }, () => {
+            sendResponse({ ok: true, session: next, lines: result.lines });
+          });
+          return;
+        }
+      }
+      sendResponse(result);
     })();
     return true;
   }
@@ -315,7 +374,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: 'Open a NAPA or O\'Reilly tab first'
+          error: 'Open a NAPA, O\'Reilly, or WebEst tab first'
         });
         return;
       }

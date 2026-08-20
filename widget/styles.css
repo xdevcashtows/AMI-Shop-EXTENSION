@@ -257,25 +257,6 @@ h2 {
   color: var(--navy-700);
 }
 
-.btn.icon-danger {
-  color: var(--danger);
-  border: none;
-  background: transparent;
-  padding: 4px;
-  width: 26px;
-  height: 26px;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  line-height: 1;
-}
-
-.btn.icon-danger:hover:not(:disabled) {
-  background: var(--danger-soft);
-}
-
 .empty {
   margin-top: 14px;
   flex: 1;
@@ -351,14 +332,6 @@ td.cost-cell {
   text-align: right;
 }
 
-th.actions-col,
-td.actions-col {
-  width: 32px;
-  padding-left: 2px;
-  padding-right: 4px;
-  text-align: center;
-}
-
 .part-cell {
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 10px;
@@ -385,6 +358,18 @@ td.actions-col {
 
 .qty-cell {
   width: 56px;
+}
+
+.hours-col,
+.hours-cell {
+  width: 44px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hours-cell {
+  color: var(--navy);
+  font-weight: 650;
 }
 
 .qty-input {
