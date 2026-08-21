@@ -826,24 +826,52 @@
         const nodes = document.querySelectorAll('input, textarea');
         /** @type {HTMLInputElement | HTMLTextAreaElement | null} */
         let input = null;
+        let best = -1;
         nodes.forEach((node) => {
-          if (input) return;
           if (
             !(node instanceof HTMLInputElement) &&
             !(node instanceof HTMLTextAreaElement)
           ) {
             return;
           }
+          if (node instanceof HTMLInputElement && node.type === 'hidden') return;
+          const id = node.id ? String(node.id) : '';
+          let labelText = '';
+          try {
+            if (id) {
+              const forLabel = document.querySelector(
+                `label[for="${CSS.escape(id)}"]`
+              );
+              if (forLabel) labelText = forLabel.textContent || '';
+            }
+          } catch (_) {
+            // ignore
+          }
           const hay = `${node.name} ${node.id} ${node.placeholder} ${
             node.getAttribute('aria-label') || ''
-          }`.toLowerCase();
-          if (hay.includes('vin')) input = node;
+          } ${labelText}`
+            .toLowerCase()
+            .replace(/\s+/g, ' ');
+          if (/\b(license|plate|tag|regist)\b/.test(hay)) return;
+          let score = 0;
+          if (/\bvin\b/.test(hay) || hay.includes('vehicle id')) score += 10;
+          if (hay.includes('enter vin')) score += 20;
+          if (score <= best) return;
+          best = score;
+          input = node;
         });
-        if (!input) return;
+        if (!input || best <= 0) return;
+        const proto =
+          input instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
         input.focus();
-        input.value = vin;
+        if (descriptor?.set) descriptor.set.call(input, vin);
+        else input.value = vin;
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('blur', { bubbles: true }));
         const jq = window.jQuery || window.$;
         if (jq) {
           const $el = jq(input);

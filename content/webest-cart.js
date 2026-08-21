@@ -859,6 +859,52 @@
     void pushCartUpdate(true);
   }
 
+  function fieldHaystack(node) {
+    const id = node.id ? String(node.id) : '';
+    let labelText = '';
+    try {
+      if (id) {
+        const forLabel = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+        if (forLabel) labelText = forLabel.textContent || '';
+      }
+    } catch {
+      // ignore
+    }
+    const parentLabel =
+      node.closest('label') instanceof HTMLLabelElement
+        ? node.closest('label')?.textContent || ''
+        : '';
+    return `${node.name || ''} ${node.id || ''} ${node.placeholder || ''} ${
+      node.getAttribute('aria-label') || ''
+    } ${labelText} ${parentLabel}`
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+  }
+
+  function isVisibleField(node) {
+    if (node instanceof HTMLInputElement && node.type === 'hidden') return false;
+    if (node.disabled) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 8;
+  }
+
+  function isPlateLookupField(node) {
+    const hay = fieldHaystack(node);
+    return /\b(license|plate|tag|regist)\b/.test(hay);
+  }
+
+  function vinFieldScore(node) {
+    if (!isVisibleField(node) || isPlateLookupField(node)) return -1;
+    const hay = fieldHaystack(node);
+    let score = 0;
+    if (/\bvin\b/.test(hay) || hay.includes('vehicle id')) score += 10;
+    if (hay.includes('enter vin')) score += 20;
+    if (node.maxLength === 17 || node.size === 17) score += 5;
+    return score;
+  }
+
   function findVinInputs() {
     const selectors = [
       'input[name*="vin" i]',
@@ -871,7 +917,7 @@
       'input[id*="VIN"]'
     ];
     /** @type {Array<HTMLInputElement | HTMLTextAreaElement>} */
-    const inputs = [];
+    const found = [];
     for (const selector of selectors) {
       try {
         document.querySelectorAll(selector).forEach((node) => {
@@ -879,32 +925,56 @@
             node instanceof HTMLInputElement ||
             node instanceof HTMLTextAreaElement
           ) {
-            inputs.push(node);
+            found.push(node);
           }
         });
       } catch {
         // some browsers reject "i" flag in selectors
       }
     }
-    if (!inputs.length) {
-      document.querySelectorAll('input, textarea').forEach((node) => {
-        if (
-          !(node instanceof HTMLInputElement) &&
-          !(node instanceof HTMLTextAreaElement)
-        ) {
-          return;
-        }
-        const hay = `${node.name} ${node.id} ${node.placeholder} ${
-          node.getAttribute('aria-label') || ''
-        }`.toLowerCase();
-        if (hay.includes('vin')) inputs.push(node);
-      });
-    }
-    return inputs;
+    document.querySelectorAll('input, textarea').forEach((node) => {
+      if (
+        !(node instanceof HTMLInputElement) &&
+        !(node instanceof HTMLTextAreaElement)
+      ) {
+        return;
+      }
+      if (vinFieldScore(node) > 0) found.push(node);
+    });
+    const unique = [...new Set(found)];
+    return unique
+      .map((node) => ({ node, score: vinFieldScore(node) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.node);
   }
 
-  function clickVinAction() {
-    const nodes = document.querySelectorAll(
+  function setNativeInputValue(input, value) {
+    const proto =
+      input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    input.focus();
+    if (descriptor?.set) descriptor.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(
+      new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertReplacementText',
+        data: value
+      })
+    );
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.dispatchEvent(new Event('blur', { bubbles: true }));
+  }
+
+  function clickVinDecodeNear(input) {
+    const root =
+      input.closest('form, section, .tab-content, .panel, .k-form, .card') ||
+      document;
+    const nodes = root.querySelectorAll(
       'button, input[type="button"], input[type="submit"], a.btn, a.button'
     );
     for (const node of nodes) {
@@ -914,12 +984,11 @@
         .replace(/\s+/g, ' ')
         .trim()
         .toLowerCase();
+      if (/\b(plate|license|tag)\b/.test(text)) continue;
+      if (text.includes('lookup vin')) continue;
       if (
-        text === 'decode' ||
         text === 'decode vin' ||
         text === 'search vin' ||
-        text === 'lookup vin' ||
-        text === 'find vehicle' ||
         text === 'vin search' ||
         (text.includes('decode') && text.includes('vin'))
       ) {
@@ -935,27 +1004,20 @@
       return { ok: false, reason: 'VIN field not found on this page' };
     }
     const input = inputs[0];
-    input.focus();
-    input.value = vin;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(
-      new KeyboardEvent('keyup', { bubbles: true, key: 'Enter' })
-    );
-    clickVinAction();
+    setNativeInputValue(input, vin);
+    clickVinDecodeNear(input);
     return { ok: true };
   }
 
   function tryFillVin(vin) {
     const value = String(vin || '').trim();
     if (!value) return { ok: false, reason: 'No VIN in session' };
-    const result = fillVinDom(value);
     try {
       window.postMessage({ source: FILL_VIN_SOURCE, vin: value }, '*');
     } catch {
-      // ignore
+      // isolated world still fills the DOM below
     }
-    return result;
+    return fillVinDom(value);
   }
 
   function estimatePathPrefix() {
