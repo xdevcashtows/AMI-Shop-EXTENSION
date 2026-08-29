@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "Chrome side panel that mirrors NAPA / O'Reilly carts and WebEst estimate lines, then transfers them into AMI Shop CRM job cards.",
   "permissions": ["storage", "tabs", "sidePanel"],
   "host_permissions": [

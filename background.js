@@ -1,7 +1,10 @@
 const STORAGE_KEYS = {
-  session: 'amiPartsBridgeSession',
+  sessionsByTab: 'amiPartsBridgeSessionsByTab',
   settings: 'amiPartsBridgeSettings',
-  pendingLines: 'amiPartsBridgePendingLines'
+  pendingByTab: 'amiPartsBridgePendingLinesByTab',
+  // Legacy singleton keys — removed on startup so they cannot fight the tab map.
+  legacySession: 'amiPartsBridgeSession',
+  legacyPending: 'amiPartsBridgePendingLines'
 };
 
 const DEFAULT_API_BASE = 'http://localhost:8787';
@@ -28,85 +31,190 @@ function isSupplierUrl(url) {
   return isOreillyUrl(url) || isNapaUrl(url) || isWebEstUrl(url);
 }
 
-function urlMatchesSupplier(url, supplier) {
-  if (supplier === 'napa') return isNapaUrl(url);
-  if (supplier === 'webest') return isWebEstUrl(url);
-  if (supplier === 'oreilly') return isOreillyUrl(url);
-  return isSupplierUrl(url);
+function tabKey(tabId) {
+  return String(tabId);
 }
 
-function getStoredSession() {
+function senderIsSupplierTab(sender) {
+  return Boolean(sender?.tab?.id != null && isSupplierUrl(sender.tab.url || ''));
+}
+
+function asObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function storageGet(keys) {
   return new Promise((resolve) => {
-    chrome.storage.local.get([STORAGE_KEYS.session], (result) => {
-      resolve(result[STORAGE_KEYS.session] || null);
+    chrome.storage.local.get(keys, (result) => {
+      resolve(result || {});
     });
   });
 }
 
-function querySupplierTabs() {
+function storageSet(values) {
   return new Promise((resolve) => {
-    chrome.tabs.query({}, (tabs) => {
-      resolve(
-        (tabs || []).filter((tab) => tab.id != null && isSupplierUrl(tab.url || ''))
-      );
-    });
+    chrome.storage.local.set(values, () => resolve());
   });
 }
 
-async function findSupplierTabId(preferredTabId) {
-  if (preferredTabId != null) {
-    try {
-      const tab = await chrome.tabs.get(preferredTabId);
-      if (tab?.id != null && isSupplierUrl(tab.url || '')) return tab.id;
-    } catch {
-      // fall through
-    }
+/** Serialize read-modify-write so two supplier tabs cannot clobber each other's carts. */
+let tabStateChain = Promise.resolve();
+
+function enqueueTabState(task) {
+  const run = tabStateChain.then(task, task);
+  tabStateChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+function mutateTabState(mutator) {
+  return enqueueTabState(async () => {
+    const result = await storageGet([
+      STORAGE_KEYS.sessionsByTab,
+      STORAGE_KEYS.pendingByTab
+    ]);
+    const ctx = {
+      sessions: asObject(result[STORAGE_KEYS.sessionsByTab]),
+      pending: asObject(result[STORAGE_KEYS.pendingByTab]),
+      result: undefined
+    };
+    await mutator(ctx);
+    await storageSet({
+      [STORAGE_KEYS.sessionsByTab]: ctx.sessions,
+      [STORAGE_KEYS.pendingByTab]: ctx.pending
+    });
+    return ctx.result;
+  });
+}
+
+async function getSessionForTab(tabId) {
+  if (tabId == null) return null;
+  const result = await storageGet([STORAGE_KEYS.sessionsByTab]);
+  return asObject(result[STORAGE_KEYS.sessionsByTab])[tabKey(tabId)] || null;
+}
+
+function moveTabState(fromTabId, toTabId) {
+  if (fromTabId == null || toTabId == null || fromTabId === toTabId) {
+    return Promise.resolve();
   }
-
-  const supplierTabs = await querySupplierTabs();
-  if (!supplierTabs.length) return null;
-
-  const session = await getStoredSession();
-  const matching = session?.supplier
-    ? supplierTabs.filter((tab) => urlMatchesSupplier(tab.url || '', session.supplier))
-    : supplierTabs;
-  const pool = matching.length ? matching : supplierTabs;
-  const active = pool.find((tab) => tab.active);
-  return (active || pool[0]).id ?? null;
+  return mutateTabState((ctx) => {
+    const fromKey = tabKey(fromTabId);
+    const toKey = tabKey(toTabId);
+    if (ctx.sessions[fromKey]) {
+      ctx.sessions[toKey] = ctx.sessions[fromKey];
+      delete ctx.sessions[fromKey];
+    }
+    if (ctx.pending[fromKey]) {
+      ctx.pending[toKey] = ctx.pending[fromKey];
+      delete ctx.pending[fromKey];
+    }
+  });
 }
 
-function openSidePanelForTab(tabId) {
-  if (tabId == null || !chrome.sidePanel?.open) return;
+function deleteTabState(tabId) {
+  if (tabId == null) return Promise.resolve();
+  return mutateTabState((ctx) => {
+    const key = tabKey(tabId);
+    delete ctx.sessions[key];
+    delete ctx.pending[key];
+  });
+}
+
+function pruneClosedTabState() {
+  return mutateTabState(async (ctx) => {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch {
+      tabs = [];
+    }
+    const live = new Set((tabs || []).map((tab) => tabKey(tab.id)));
+    for (const key of Object.keys(ctx.sessions)) {
+      if (!live.has(key)) delete ctx.sessions[key];
+    }
+    for (const key of Object.keys(ctx.pending)) {
+      if (!live.has(key)) delete ctx.pending[key];
+    }
+  });
+}
+
+async function getTab(tabId) {
+  if (tabId == null) return null;
   try {
-    void chrome.sidePanel.open({ tabId }).catch(() => {
-      // May require a user gesture; toolbar icon still opens the panel.
+    return await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Content scripts always bind to their own tab.
+ * The side panel must pass tabId and it must still be a live supplier tab.
+ * Never fall back to "first supplier tab" — that is what mixed up job carts.
+ */
+async function resolveSupplierTabId(message, sender) {
+  if (senderIsSupplierTab(sender)) {
+    return sender.tab.id;
+  }
+  const requested =
+    message?.tabId != null && Number.isFinite(Number(message.tabId))
+      ? Number(message.tabId)
+      : null;
+  if (requested == null) return null;
+  const tab = await getTab(requested);
+  if (tab?.id != null && isSupplierUrl(tab.url || '')) return tab.id;
+  return null;
+}
+
+function requestedTabId(message, sender) {
+  if (sender?.tab?.id != null) return sender.tab.id;
+  if (message?.tabId != null && Number.isFinite(Number(message.tabId))) {
+    return Number(message.tabId);
+  }
+  return null;
+}
+
+async function syncSidePanelForTab(tab) {
+  if (tab?.id == null || !chrome.sidePanel?.setOptions) return;
+  const enabled = isSupplierUrl(tab.url || '');
+  try {
+    await chrome.sidePanel.setOptions({
+      tabId: tab.id,
+      path: 'sidepanel/index.html',
+      enabled
     });
   } catch {
     // ignore
   }
 }
 
-async function openSidePanelOnSupplierTabs(preferredTabId) {
-  const tabId = await findSupplierTabId(preferredTabId);
-  if (tabId != null) {
-    openSidePanelForTab(tabId);
-    return;
-  }
-  const supplierTabs = await querySupplierTabs();
-  for (const tab of supplierTabs) {
-    openSidePanelForTab(tab.id);
-  }
-}
-
-function notifySupplierTabs(message) {
-  chrome.tabs.query({}, (tabs) => {
-    for (const tab of tabs) {
-      if (!tab.id || !isSupplierUrl(tab.url || '')) continue;
-      chrome.tabs.sendMessage(tab.id, message, () => {
-        void chrome.runtime.lastError;
+function openSidePanelForTab(tabId) {
+  if (tabId == null || !chrome.sidePanel?.open) return;
+  try {
+    void (async () => {
+      const tab = await getTab(tabId);
+      if (tab && isSupplierUrl(tab.url || '')) {
+        await syncSidePanelForTab(tab);
+      } else if (chrome.sidePanel.setOptions) {
+        try {
+          await chrome.sidePanel.setOptions({
+            tabId,
+            path: 'sidepanel/index.html',
+            enabled: true
+          });
+        } catch {
+          // ignore
+        }
+      }
+      await chrome.sidePanel.open({ tabId }).catch(() => {
+        // May require a user gesture; toolbar icon still opens the panel.
       });
-    }
-  });
+    })();
+  } catch {
+    // ignore
+  }
 }
 
 function sendToSupplierTab(tabId, message) {
@@ -124,23 +232,65 @@ function sendToSupplierTab(tabId, message) {
   });
 }
 
-// Open the native side panel when the toolbar icon is clicked.
+function notifyTab(tabId, message) {
+  if (tabId == null) return;
+  chrome.tabs.sendMessage(tabId, message, () => {
+    void chrome.runtime.lastError;
+  });
+}
+
 try {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 } catch {
   // ignore
 }
 
+void chrome.storage.local.remove([
+  STORAGE_KEYS.legacySession,
+  STORAGE_KEYS.legacyPending
+]);
+void pruneClosedTabState();
+void chrome.tabs.query({}).then((tabs) => {
+  for (const tab of tabs || []) {
+    void syncSidePanelForTab(tab);
+  }
+}).catch(() => {});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status === 'complete') {
+    void syncSidePanelForTab(tab || { id: tabId, url: changeInfo.url || '' });
+  }
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  void syncSidePanelForTab(tab);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void deleteTabState(tabId);
+});
+
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  void moveTabState(removedTabId, addedTabId);
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return;
 
   if (message.type === 'AMI_GET_SESSION') {
-    chrome.storage.local.get([STORAGE_KEYS.session, STORAGE_KEYS.settings], (result) => {
+    void (async () => {
+      const tabId = requestedTabId(message, sender);
+      const tab = await getTab(tabId);
+      const isSupplierTab = Boolean(tab && isSupplierUrl(tab.url || ''));
+      const session = tabId != null ? await getSessionForTab(tabId) : null;
+      const result = await storageGet([STORAGE_KEYS.settings]);
       sendResponse({
-        session: result[STORAGE_KEYS.session] || null,
+        session,
+        tabId,
+        isSupplierTab,
         settings: result[STORAGE_KEYS.settings] || { apiBaseUrl: DEFAULT_API_BASE }
       });
-    });
+    })();
     return true;
   }
 
@@ -150,110 +300,143 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'Missing session' });
       return;
     }
-    chrome.storage.local.get(
-      [STORAGE_KEYS.settings, STORAGE_KEYS.pendingLines, STORAGE_KEYS.session],
-      (result) => {
-        const settings = result[STORAGE_KEYS.settings] || {};
-        const previous = result[STORAGE_KEYS.session] || null;
-        const pending = Array.isArray(result[STORAGE_KEYS.pendingLines])
-          ? result[STORAGE_KEYS.pendingLines]
-          : [];
-        const apiBaseUrl = settings.apiBaseUrl || DEFAULT_API_BASE;
-        const incomingLines = Array.isArray(session.lines) ? session.lines : [];
+    void (async () => {
+      // CRM CustomEvent is only a heads-up. Bind on the supplier-tab hash handshake
+      // so a second job cannot overwrite the first job's window.
+      if (!senderIsSupplierTab(sender)) {
+        sendResponse({ ok: true, deferred: true });
+        return;
+      }
 
+      const tabId = sender.tab.id;
+      const result = await storageGet([STORAGE_KEYS.settings]);
+      const settings = result[STORAGE_KEYS.settings] || {};
+      const apiBaseUrl = settings.apiBaseUrl || DEFAULT_API_BASE;
+      const incomingLines = Array.isArray(session.lines) ? session.lines : [];
+      const key = tabKey(tabId);
+
+      const next = await mutateTabState((ctx) => {
+        const previous = ctx.sessions[key] || null;
         const sameSession =
           previous && previous.sessionId && previous.sessionId === session.sessionId;
+        const pending = Array.isArray(ctx.pending[key]) ? ctx.pending[key] : [];
+        if (!sameSession) delete ctx.pending[key];
 
-        // Fresh Order from supplier / new session always starts with an empty shop cart.
-        // Only keep lines if this is an explicit update to the same sessionId with lines provided.
         const lines = incomingLines.length
           ? incomingLines
           : sameSession
             ? previous.lines || []
-            : [];
+            : pending;
 
-        const next = {
+        const bound = {
           ...session,
           apiBaseUrl: session.apiBaseUrl || apiBaseUrl,
           lines,
+          transferredAt: sameSession ? previous.transferredAt || null : null,
           updatedAt: new Date().toISOString()
         };
-        chrome.storage.local.set(
-          {
-            [STORAGE_KEYS.session]: next,
-            // Never carry pending scrapes into a newly opened supplier session.
-            [STORAGE_KEYS.pendingLines]: sameSession ? pending : []
-          },
-          () => {
-            notifySupplierTabs({
-              type: 'AMI_SESSION_UPDATED',
-              session: next,
-              resetCart: !sameSession
-            });
-            void openSidePanelOnSupplierTabs(sender.tab?.id);
-            sendResponse({ ok: true, session: next });
-          }
-        );
+        ctx.sessions[key] = bound;
+        ctx.result = { session: bound, resetCart: !sameSession };
+      });
+
+      if (!next?.session) {
+        sendResponse({ ok: false, error: 'Could not bind session to this tab' });
+        return;
       }
-    );
+
+      notifyTab(tabId, {
+        type: 'AMI_SESSION_UPDATED',
+        session: next.session,
+        resetCart: next.resetCart
+      });
+      openSidePanelForTab(tabId);
+      sendResponse({ ok: true, session: next.session, tabId });
+    })();
     return true;
   }
 
   if (message.type === 'AMI_UPDATE_CART') {
-    chrome.storage.local.get([STORAGE_KEYS.session], (result) => {
-      const session = result[STORAGE_KEYS.session];
+    void (async () => {
+      const tabId = await resolveSupplierTabId(message, sender);
       const lines = Array.isArray(message.lines) ? message.lines : [];
-      // Explicit clears / O'Reilly sync / widget ✕ must be allowed to empty the cart.
       const allowEmpty = message.allowEmpty === true;
 
-      // Keep scraped lines even before a CRM session exists.
-      if (!session) {
-        chrome.storage.local.set({ [STORAGE_KEYS.pendingLines]: lines }, () => {
-          sendResponse({ ok: true, pending: true, lines });
-        });
+      if (tabId == null) {
+        sendResponse({ ok: false, error: 'No supplier tab for this cart update' });
         return;
       }
 
-      // Don't wipe a populated cart with an accidental empty scrape —
-      // unless the caller explicitly allows empty (remove / authoritative sync).
-      if (
-        !allowEmpty &&
-        lines.length === 0 &&
-        Array.isArray(session.lines) &&
-        session.lines.length > 0
-      ) {
-        sendResponse({ ok: true, session, ignoredEmpty: true });
-        return;
-      }
+      const key = tabKey(tabId);
+      const outcome = await mutateTabState((ctx) => {
+        const session = ctx.sessions[key] || null;
+        if (!session) {
+          if (!Array.isArray(lines) || lines.length === 0) {
+            delete ctx.pending[key];
+          } else {
+            ctx.pending[key] = lines;
+          }
+          ctx.result = { ok: true, pending: true, lines, tabId };
+          return;
+        }
 
-      const next = {
-        ...session,
-        lines,
-        updatedAt: new Date().toISOString()
-      };
-      chrome.storage.local.set({ [STORAGE_KEYS.session]: next }, () => {
-        sendResponse({ ok: true, session: next });
+        if (
+          !allowEmpty &&
+          lines.length === 0 &&
+          Array.isArray(session.lines) &&
+          session.lines.length > 0
+        ) {
+          ctx.result = { ok: true, session, ignoredEmpty: true, tabId };
+          return;
+        }
+
+        const nextSession = {
+          ...session,
+          lines,
+          transferredAt: lines.length > 0 ? null : session.transferredAt || null,
+          updatedAt: new Date().toISOString()
+        };
+        ctx.sessions[key] = nextSession;
+        ctx.result = { ok: true, session: nextSession, tabId };
       });
-    });
+      sendResponse(outcome || { ok: false, error: 'Cart update failed', tabId });
+    })();
     return true;
   }
 
   if (message.type === 'AMI_CLEAR_SESSION') {
-    chrome.storage.local.remove(
-      [STORAGE_KEYS.session, STORAGE_KEYS.pendingLines],
-      () => {
-        sendResponse({ ok: true });
+    void (async () => {
+      const tabId = await resolveSupplierTabId(message, sender);
+      if (tabId == null) {
+        sendResponse({ ok: false, error: 'No supplier tab to clear' });
+        return;
       }
-    );
+      await deleteTabState(tabId);
+      notifyTab(tabId, {
+        type: 'AMI_SESSION_UPDATED',
+        session: null,
+        resetCart: true
+      });
+      sendResponse({ ok: true, tabId });
+    })();
     return true;
   }
 
   if (message.type === 'AMI_TRANSFER') {
-    chrome.storage.local.get([STORAGE_KEYS.session, STORAGE_KEYS.settings], async (result) => {
-      const session = result[STORAGE_KEYS.session];
+    void (async () => {
+      const tabId = await resolveSupplierTabId(message, sender);
+      if (tabId == null) {
+        sendResponse({
+          ok: false,
+          error: "Open a NAPA, O'Reilly, or WebEst tab first"
+        });
+        return;
+      }
+
+      const session = await getSessionForTab(tabId);
+      const result = await storageGet([STORAGE_KEYS.settings]);
       const settings = result[STORAGE_KEYS.settings] || {};
       if (!session) {
-        sendResponse({ ok: false, error: 'No active session' });
+        sendResponse({ ok: false, error: 'No active session for this tab' });
         return;
       }
       const lines = Array.isArray(message.lines)
@@ -264,10 +447,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const apiBase = (settings.apiBaseUrl || session.apiBaseUrl || DEFAULT_API_BASE).replace(
-        /\/$/,
-        ''
-      );
+      const apiBase = (
+        settings.apiBaseUrl ||
+        session.apiBaseUrl ||
+        DEFAULT_API_BASE
+      ).replace(/\/$/, '');
 
       try {
         const response = await fetch(
@@ -294,37 +478,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const cleared = {
-          ...session,
-          lines: [],
-          updatedAt: new Date().toISOString()
-        };
-        chrome.storage.local.set({ [STORAGE_KEYS.session]: cleared }, () => {
-          sendResponse({ ok: true, payload, session: cleared });
+        const transferredAt = new Date().toISOString();
+        const cleared = await mutateTabState((ctx) => {
+          const current = ctx.sessions[tabKey(tabId)];
+          if (!current || current.sessionId !== session.sessionId) {
+            ctx.result = {
+              ...session,
+              lines: [],
+              transferredAt,
+              updatedAt: transferredAt
+            };
+            return;
+          }
+          const nextSession = {
+            ...current,
+            lines: [],
+            transferredAt,
+            updatedAt: transferredAt
+          };
+          ctx.sessions[tabKey(tabId)] = nextSession;
+          ctx.result = nextSession;
         });
+        sendResponse({ ok: true, payload, session: cleared, tabId });
       } catch (error) {
         sendResponse({
           ok: false,
           error: error instanceof Error ? error.message : 'Transfer failed'
         });
       }
-    });
+    })();
     return true;
   }
 
   if (message.type === 'AMI_SHOW_WIDGET') {
-    void openSidePanelOnSupplierTabs(sender.tab?.id);
+    if (senderIsSupplierTab(sender)) {
+      openSidePanelForTab(sender.tab.id);
+    }
     sendResponse({ ok: true, sidePanel: true });
     return true;
   }
 
   if (message.type === 'AMI_FILL_VIN') {
     void (async () => {
-      const tabId = await findSupplierTabId(sender.tab?.id);
+      const tabId = await resolveSupplierTabId(message, sender);
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: 'Open a NAPA, O\'Reilly, or WebEst tab first'
+          error: "Open a NAPA, O'Reilly, or WebEst tab first"
         });
         return;
       }
@@ -335,7 +535,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'AMI_REMOVE_ESTIMATE_LINE') {
     void (async () => {
-      const tabId = await findSupplierTabId(sender.tab?.id);
+      const tabId = await resolveSupplierTabId(message, sender);
       if (tabId == null) {
         sendResponse({
           ok: false,
@@ -349,16 +549,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         estimateLineId: message.estimateLineId
       });
       if (result?.ok && Array.isArray(result.lines)) {
-        const stored = await getStoredSession();
-        if (stored) {
-          const next = {
+        const next = await mutateTabState((ctx) => {
+          const stored = ctx.sessions[tabKey(tabId)];
+          if (!stored) {
+            ctx.result = null;
+            return;
+          }
+          const updated = {
             ...stored,
             lines: result.lines,
+            transferredAt:
+              result.lines.length > 0 ? null : stored.transferredAt || null,
             updatedAt: new Date().toISOString()
           };
-          chrome.storage.local.set({ [STORAGE_KEYS.session]: next }, () => {
-            sendResponse({ ok: true, session: next, lines: result.lines });
-          });
+          ctx.sessions[tabKey(tabId)] = updated;
+          ctx.result = updated;
+        });
+        if (next) {
+          sendResponse({ ok: true, session: next, lines: result.lines, tabId });
           return;
         }
       }
@@ -367,18 +575,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Side panel Refresh → content script re-fetches supplier cart snapshot.
   if (message.type === 'AMI_SCRAPE_NOW') {
     void (async () => {
-      const tabId = await findSupplierTabId(sender.tab?.id);
+      const tabId = await resolveSupplierTabId(message, sender);
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: 'Open a NAPA, O\'Reilly, or WebEst tab first'
+          error: "Open a NAPA, O'Reilly, or WebEst tab first"
         });
         return;
       }
-      // Ping cart scripts + supplier-bridge (both listen for AMI_SCRAPE_NOW).
       sendResponse(await sendToSupplierTab(tabId, { type: 'AMI_SCRAPE_NOW' }));
     })();
     return true;

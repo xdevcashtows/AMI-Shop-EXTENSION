@@ -504,19 +504,4 @@
     }
   });
 
-  Ami?.onStorageChanged((changes, area) => {
-    if (area !== 'local' || !changes.amiPartsBridgeSession) return;
-    const next = changes.amiPartsBridgeSession.newValue;
-    if (!next) {
-      networkLines = [];
-      lastSentSignature = '';
-      return;
-    }
-    const nextLines = Array.isArray(next.lines) ? next.lines : [];
-    const nextSig = JSON.stringify(
-      nextLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
-    );
-    if (nextSig === lastSentSignature) return;
-    void pushCartUpdate(true);
-  });
 })();

@@ -71,7 +71,16 @@
     }
   }
 
+  function isTopWindow() {
+    try {
+      return window === window.top;
+    } catch {
+      return false;
+    }
+  }
+
   function applySessionFromLaunchUrl() {
+    if (!isTopWindow()) return;
     if (!ensureAlive()) return;
     const payload = parseBridgePayloadFromHash();
     if (!payload) {

@@ -1,5 +1,10 @@
 /** @type {any} */
 let currentSession = null;
+/** @type {number | null} */
+let currentTabId = null;
+/** @type {number | null} */
+let panelWindowId = null;
+let activeTabIsSupplier = false;
 
 function extensionAlive() {
   try {
@@ -19,7 +24,9 @@ function sendMessage(message) {
       return;
     }
     try {
-      chrome.runtime.sendMessage(message, (response) => {
+      const payload =
+        currentTabId != null ? { ...message, tabId: currentTabId } : message;
+      chrome.runtime.sendMessage(payload, (response) => {
         const err = chrome.runtime.lastError;
         if (err) {
           resolve({
@@ -124,8 +131,47 @@ function isLaborOnlyLine(line) {
   );
 }
 
+function jobNumberLabel(session) {
+  if (session?.jobNumber) return `Job ${session.jobNumber}`;
+  if (session?.jobCardId) return `Job ${String(session.jobCardId).slice(0, 8)}…`;
+  return 'Draft job';
+}
+
+function wasTransferred(session) {
+  return Boolean(session?.transferredAt) && !(session?.lines || []).length;
+}
+
+function renderEmptyState({ title, hint }) {
+  els.cartEmpty.classList.remove('hidden');
+  els.cartEmpty.innerHTML = `
+      <span class="empty-title">${escapeHtml(title)}</span>
+      <span class="empty-hint">${escapeHtml(hint)}</span>
+    `;
+  els.cartTable.classList.add('hidden');
+  els.cartBody.innerHTML = '';
+}
+
 function render() {
   const session = currentSession;
+  if (!activeTabIsSupplier) {
+    els.subtitle.textContent = 'Switch to a supplier tab';
+    els.supplierBadge.classList.add('hidden');
+    els.jobLabel.textContent = '—';
+    els.ymmLabel.textContent = '—';
+    els.vehicleLabel.innerHTML = '—';
+    els.copyVinBtn.disabled = true;
+    els.fillVinBtn.disabled = true;
+    els.fillVinBtn.classList.remove('hidden');
+    els.transferBtn.disabled = true;
+    setCartCount(0);
+    els.hoursColHeader?.classList.add('hidden');
+    renderEmptyState({
+      title: 'No supplier tab selected',
+      hint: 'Switch to a NAPA, O’Reilly, or WebEst tab to see that job’s cart.'
+    });
+    return;
+  }
+
   if (!session) {
     els.subtitle.textContent = 'No active session — start from a job card';
     els.supplierBadge.classList.add('hidden');
@@ -138,26 +184,22 @@ function render() {
     els.transferBtn.disabled = true;
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
-    els.cartEmpty.classList.remove('hidden');
-    els.cartEmpty.innerHTML = `
-      <span class="empty-title">No active session</span>
-      <span class="empty-hint">Start shopping from a job card in AMI Shop CRM.</span>
-    `;
-    els.cartTable.classList.add('hidden');
-    els.cartBody.innerHTML = '';
+    renderEmptyState({
+      title: 'No active session',
+      hint: 'Start shopping from a job card in AMI Shop CRM.'
+    });
     return;
   }
 
   const supplierLabel = supplierDisplayName(session.supplier, false);
   const isWebEst = session.supplier === 'webest';
-  els.subtitle.textContent = 'Shop, then transfer when ready';
+  const transferred = wasTransferred(session);
+  els.subtitle.textContent = transferred
+    ? 'Already transferred from this window'
+    : 'Shop, then transfer when ready';
   els.supplierBadge.textContent = supplierLabel;
   els.supplierBadge.classList.remove('hidden');
-  els.jobLabel.textContent = session.jobNumber
-    ? `Job ${session.jobNumber}`
-    : session.jobCardId
-      ? `Job ${session.jobCardId.slice(0, 8)}…`
-      : 'Draft job';
+  els.jobLabel.textContent = `${jobNumberLabel(session)} · ${supplierLabel}`;
   els.ymmLabel.textContent = ymmText(session.vehicle);
   els.vehicleLabel.innerHTML = renderVinHtml(session.vehicle);
   els.copyVinBtn.disabled = !session.vehicle?.vin;
@@ -172,17 +214,21 @@ function render() {
   setCartCount(lines.length);
 
   if (!lines.length) {
-    els.cartEmpty.classList.remove('hidden');
+    if (transferred) {
+      renderEmptyState({
+        title: 'Transferred',
+        hint: 'This window is no longer waiting on the job card. You can close it, or keep shopping to transfer more items.'
+      });
+      return;
+    }
     const supplierName = supplierDisplayName(session.supplier, true);
     const emptyHint = isWebEst
       ? `Add parts to the ${supplierName} estimate and they’ll show up here.`
       : `Add parts to your ${supplierName} cart and they’ll show up here.`;
-    els.cartEmpty.innerHTML = `
-      <span class="empty-title">${isWebEst ? 'No estimate lines' : 'Cart is empty'}</span>
-      <span class="empty-hint">${emptyHint}</span>
-    `;
-    els.cartTable.classList.add('hidden');
-    els.cartBody.innerHTML = '';
+    renderEmptyState({
+      title: isWebEst ? 'No estimate lines' : 'Cart is empty',
+      hint: emptyHint
+    });
     return;
   }
 
@@ -240,13 +286,37 @@ function render() {
   });
 }
 
+async function resolveActiveTab() {
+  if (!extensionAlive()) {
+    currentTabId = null;
+    panelWindowId = null;
+    activeTabIsSupplier = false;
+    return null;
+  }
+  try {
+    const win = await chrome.windows.getCurrent({ populate: true });
+    panelWindowId = win?.id ?? null;
+    const tab = (win?.tabs || []).find((item) => item.active) || null;
+    currentTabId = tab?.id ?? null;
+    return tab;
+  } catch {
+    currentTabId = null;
+    return null;
+  }
+}
+
 async function load() {
+  const tab = await resolveActiveTab();
   const response = await sendMessage({ type: 'AMI_GET_SESSION' });
   if (response?.error) {
     setStatus(response.error, 'err');
     return;
   }
   currentSession = response?.session || null;
+  activeTabIsSupplier = Boolean(
+    response?.isSupplierTab ?? (tab && /web-est|napaprolink|firstcallonline|oreillyauto/.test(tab.url || ''))
+  );
+  if (response?.tabId != null) currentTabId = response.tabId;
   render();
 }
 
@@ -362,7 +432,11 @@ els.transferBtn.addEventListener('click', async () => {
   if (response?.session) {
     currentSession = response.session;
   } else if (currentSession) {
-    currentSession = { ...currentSession, lines: [] };
+    currentSession = {
+      ...currentSession,
+      lines: [],
+      transferredAt: new Date().toISOString()
+    };
   }
   render();
   const jobSuffix = jobLabel ? ` to job card ${jobLabel}` : ' to the job card';
@@ -372,13 +446,57 @@ els.transferBtn.addEventListener('click', async () => {
   );
 });
 
+function tabBelongsToPanel(tabId, windowId) {
+  if (panelWindowId != null && windowId != null && windowId !== panelWindowId) {
+    return false;
+  }
+  return true;
+}
+
 try {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (!extensionAlive()) return;
     if (area !== 'local') return;
-    if (changes.amiPartsBridgeSession) {
-      currentSession = changes.amiPartsBridgeSession.newValue || null;
-      render();
+    if (!changes.amiPartsBridgeSessionsByTab) return;
+    const map = changes.amiPartsBridgeSessionsByTab.newValue || {};
+    if (currentTabId == null) {
+      void load();
+      return;
+    }
+    currentSession = map[String(currentTabId)] || null;
+    render();
+  });
+} catch {
+  // ignore
+}
+
+try {
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    if (!extensionAlive()) return;
+    if (!tabBelongsToPanel(activeInfo.tabId, activeInfo.windowId)) return;
+    void load();
+  });
+} catch {
+  // ignore
+}
+
+try {
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (!extensionAlive()) return;
+    if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+    if (panelWindowId != null && windowId !== panelWindowId) return;
+    void load();
+  });
+} catch {
+  // ignore
+}
+
+try {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (!extensionAlive()) return;
+    if (tabId !== currentTabId) return;
+    if (changeInfo.url || changeInfo.status === 'complete') {
+      void load();
     }
   });
 } catch {

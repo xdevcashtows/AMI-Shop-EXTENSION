@@ -1136,7 +1136,9 @@
       markDead();
       return;
     }
-    if (!isAddPartsPage() && !force) return;
+    // Only the add-parts frame publishes. Iframes on other paths must not
+    // compete for this tab's cart, even on a forced scrape/reset.
+    if (!isAddPartsPage()) return;
 
     const lines = scrapeCartLines();
     const signature = JSON.stringify(
@@ -1273,27 +1275,4 @@
     }
   });
 
-  Ami?.onStorageChanged((changes, area) => {
-    if (area !== 'local' || !changes.amiPartsBridgeSession) return;
-    const next = changes.amiPartsBridgeSession.newValue;
-    if (!next) {
-      sectionLines.clear();
-      networkLines = [];
-      lastSentSignature = '';
-      return;
-    }
-    const nextLines = Array.isArray(next.lines) ? next.lines : [];
-    const nextSig = JSON.stringify(
-      nextLines.map((l) => [
-        l.externalId,
-        l.partNumber,
-        l.description,
-        l.quantity,
-        l.cost,
-        l.laborHours
-      ])
-    );
-    if (nextSig === lastSentSignature) return;
-    if (isAddPartsPage()) void pushCartUpdate(true);
-  });
 })();

@@ -937,24 +937,4 @@
     }
   });
 
-  // Keep in-page cart mirror aligned when the widget ✕ removes lines from storage.
-  Ami?.onStorageChanged((changes, area) => {
-    if (area !== 'local' || !changes.amiPartsBridgeSession) return;
-    const next = changes.amiPartsBridgeSession.newValue;
-    if (!next) {
-      networkLines = [];
-      lastSentSignature = '';
-      return;
-    }
-    const nextLines = Array.isArray(next.lines) ? next.lines : [];
-    const nextSig = JSON.stringify(
-      nextLines.map((l) => [l.partNumber, l.description, l.quantity, l.cost])
-    );
-    // Only adopt when storage is ahead of (or emptier than) our local mirror —
-    // avoids fighting an in-flight FirstCall sync.
-    if (nextSig !== lastSentSignature) {
-      networkLines = nextLines.map((line) => ({ ...line }));
-      lastSentSignature = nextSig;
-    }
-  });
 })();
