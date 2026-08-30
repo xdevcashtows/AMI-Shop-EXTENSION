@@ -134,6 +134,68 @@ h2 {
   min-width: 0;
 }
 
+.part-supplies-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--navy);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.part-supplies-toggle input {
+  accent-color: var(--navy);
+  margin: 0;
+  width: 13px;
+  height: 13px;
+}
+
+.part-supplies-toggle:has(input:checked) {
+  border-color: var(--navy-700);
+  background: var(--navy-soft);
+}
+
+.part-supplies-row td {
+  background: #f1f5f9;
+  border-top: 1px solid var(--border-strong);
+  font-weight: 650;
+}
+
+.part-supplies-row .desc-cell {
+  color: var(--navy-700);
+}
+
+.part-supplies-row .hours-cell {
+  font-weight: 750;
+}
+
+.part-supplies-remove {
+  margin-left: 6px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  vertical-align: middle;
+}
+
+.part-supplies-remove:hover,
+.part-supplies-remove:focus-visible {
+  color: var(--danger);
+  outline: none;
+}
+
 .count-pill {
   display: inline-flex;
   align-items: center;

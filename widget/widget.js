@@ -65,6 +65,8 @@ const els = {
   cartTable: document.getElementById('cartTable'),
   cartBody: document.getElementById('cartBody'),
   hoursColHeader: document.getElementById('hoursColHeader'),
+  partSuppliesToggle: document.getElementById('partSuppliesToggle'),
+  partSuppliesEnabled: document.getElementById('partSuppliesEnabled'),
   status: document.getElementById('status'),
   clearBtn: document.getElementById('clearBtn'),
   transferBtn: document.getElementById('transferBtn')
@@ -131,6 +133,70 @@ function isLaborOnlyLine(line) {
   );
 }
 
+function normalizeLaborCategory(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function isSuppliesActivityCategory(value) {
+  const normalized = normalizeLaborCategory(value);
+  return (
+    normalized === 'body' ||
+    normalized === 'paint panel' ||
+    normalized === 'paint' ||
+    normalized === 'clearcoat' ||
+    normalized === 'clear coat'
+  );
+}
+
+function formatCartHours(value) {
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  return String(Math.round(value * 100) / 100);
+}
+
+function sumPartSuppliesHours(lines) {
+  return (lines || []).reduce((sum, line) => {
+    if (!isLaborOnlyLine(line)) return sum;
+    const category = line.laborCategory || line.description || '';
+    if (!isSuppliesActivityCategory(category)) return sum;
+    const hours = Number(line.laborHours);
+    return sum + (Number.isFinite(hours) ? hours : 0);
+  }, 0);
+}
+
+function isPartSuppliesEnabled(session) {
+  return session?.partSuppliesEnabled !== false;
+}
+
+function buildPartSuppliesLine(hours) {
+  return {
+    partNumber: '',
+    description: 'Part Supplies',
+    laborCategory: 'Part Supplies',
+    laborHours: hours,
+    quantity: 0,
+    cost: 0,
+    lineKind: 'labor',
+    vendor: 'WebEst'
+  };
+}
+
+function linesForTransfer(session) {
+  const lines = Array.isArray(session?.lines) ? [...session.lines] : [];
+  const hours = sumPartSuppliesHours(lines);
+  if (isPartSuppliesEnabled(session) && hours > 0) {
+    lines.push(buildPartSuppliesLine(hours));
+  }
+  return lines;
+}
+
+function setPartSuppliesToggleVisible(visible) {
+  els.partSuppliesToggle?.classList.toggle('hidden', !visible);
+}
+
 function jobNumberLabel(session) {
   if (session?.jobNumber) return `Job ${session.jobNumber}`;
   if (session?.jobCardId) return `Job ${String(session.jobCardId).slice(0, 8)}…`;
@@ -165,6 +231,7 @@ function render() {
     els.transferBtn.disabled = true;
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
+    setPartSuppliesToggleVisible(false);
     renderEmptyState({
       title: 'No supplier tab selected',
       hint: 'Switch to a NAPA, O’Reilly, or WebEst tab to see that job’s cart.'
@@ -184,6 +251,7 @@ function render() {
     els.transferBtn.disabled = true;
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
+    setPartSuppliesToggleVisible(false);
     renderEmptyState({
       title: 'No active session',
       hint: 'Start shopping from a job card in AMI Shop CRM.'
@@ -214,6 +282,7 @@ function render() {
   setCartCount(lines.length);
 
   if (!lines.length) {
+    setPartSuppliesToggleVisible(false);
     if (transferred) {
       renderEmptyState({
         title: 'Transferred',
@@ -284,6 +353,37 @@ function render() {
 
     els.cartBody.appendChild(tr);
   });
+
+  const suppliesHours = sumPartSuppliesHours(lines);
+  const showSupplies = suppliesHours > 0;
+  setPartSuppliesToggleVisible(showSupplies);
+  if (els.partSuppliesEnabled) {
+    els.partSuppliesEnabled.checked = isPartSuppliesEnabled(session);
+  }
+
+  if (showSupplies && isPartSuppliesEnabled(session)) {
+    const hoursLabel = formatCartHours(suppliesHours);
+    const tr = document.createElement('tr');
+    tr.className = 'part-supplies-row';
+    tr.innerHTML = `
+      <td class="part-cell">—</td>
+      <td class="desc-cell" title="Part Supplies">Part Supplies</td>
+      <td class="qty-cell num">—</td>
+      ${
+        showHours
+          ? `<td class="hours-cell num" title="${escapeHtml(hoursLabel)} hrs">${escapeHtml(hoursLabel)}</td>`
+          : ''
+      }
+      <td class="cost-cell">
+        <span>—</span>
+        <button type="button" class="part-supplies-remove" aria-label="Hide Part Supplies" title="Hide Part Supplies">×</button>
+      </td>
+    `;
+    tr.querySelector('.part-supplies-remove')?.addEventListener('click', () => {
+      void setPartSuppliesEnabled(false);
+    });
+    els.cartBody.appendChild(tr);
+  }
 }
 
 async function resolveActiveTab() {
@@ -317,6 +417,24 @@ async function load() {
     response?.isSupplierTab ?? (tab && /web-est|napaprolink|firstcallonline|oreillyauto/.test(tab.url || ''))
   );
   if (response?.tabId != null) currentTabId = response.tabId;
+  render();
+}
+
+async function setPartSuppliesEnabled(enabled) {
+  if (!currentSession) return;
+  currentSession = { ...currentSession, partSuppliesEnabled: enabled };
+  render();
+  const response = await sendMessage({
+    type: 'AMI_SET_CART_OPTION',
+    partSuppliesEnabled: enabled
+  });
+  if (response?.error) {
+    setStatus(response.error, 'err');
+    return;
+  }
+  if (response?.session) {
+    currentSession = response.session;
+  }
   render();
 }
 
@@ -400,6 +518,10 @@ if (els.refreshBtn) {
   });
 }
 
+els.partSuppliesEnabled?.addEventListener('change', () => {
+  void setPartSuppliesEnabled(Boolean(els.partSuppliesEnabled.checked));
+});
+
 els.clearBtn.addEventListener('click', async () => {
   const response = await sendMessage({ type: 'AMI_CLEAR_SESSION' });
   if (response?.error) {
@@ -423,7 +545,7 @@ els.transferBtn.addEventListener('click', async () => {
   setStatus('Transferring…');
   const response = await sendMessage({
     type: 'AMI_TRANSFER',
-    lines: currentSession.lines
+    lines: linesForTransfer(currentSession)
   });
   if (!response?.ok) {
     setStatus(response?.error || 'Transfer failed', 'err');

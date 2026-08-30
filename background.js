@@ -332,6 +332,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ...session,
           apiBaseUrl: session.apiBaseUrl || apiBaseUrl,
           lines,
+          partSuppliesEnabled: sameSession
+            ? previous.partSuppliesEnabled !== false
+            : true,
           transferredAt: sameSession ? previous.transferredAt || null : null,
           updatedAt: new Date().toISOString()
         };
@@ -399,6 +402,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ctx.result = { ok: true, session: nextSession, tabId };
       });
       sendResponse(outcome || { ok: false, error: 'Cart update failed', tabId });
+    })();
+    return true;
+  }
+
+  if (message.type === 'AMI_SET_CART_OPTION') {
+    void (async () => {
+      const tabId = await resolveSupplierTabId(message, sender);
+      if (tabId == null) {
+        sendResponse({ ok: false, error: 'No supplier tab for this option' });
+        return;
+      }
+      const outcome = await mutateTabState((ctx) => {
+        const key = tabKey(tabId);
+        const session = ctx.sessions[key] || null;
+        if (!session) {
+          ctx.result = { ok: false, error: 'No active session for this tab' };
+          return;
+        }
+        const nextSession = {
+          ...session,
+          partSuppliesEnabled: message.partSuppliesEnabled !== false,
+          updatedAt: new Date().toISOString()
+        };
+        ctx.sessions[key] = nextSession;
+        ctx.result = { ok: true, session: nextSession, tabId };
+      });
+      sendResponse(outcome || { ok: false, error: 'Could not update option' });
     })();
     return true;
   }
