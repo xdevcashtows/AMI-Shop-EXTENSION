@@ -27,8 +27,27 @@ function isWebEstUrl(url) {
   return url.includes('web-est.com');
 }
 
+function isAutoIntegrateUrl(url) {
+  if (!url) return false;
+  return (
+    url.includes('online.autointegrate.com') ||
+    url.includes('api.autointegrate.com')
+  );
+}
+
+function isERepairUrl(url) {
+  if (!url) return false;
+  return url.includes('erepair.wheels.com');
+}
+
 function isSupplierUrl(url) {
-  return isOreillyUrl(url) || isNapaUrl(url) || isWebEstUrl(url);
+  return (
+    isOreillyUrl(url) ||
+    isNapaUrl(url) ||
+    isWebEstUrl(url) ||
+    isAutoIntegrateUrl(url) ||
+    isERepairUrl(url)
+  );
 }
 
 function tabKey(tabId) {
@@ -457,7 +476,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: "Open a NAPA, O'Reilly, or WebEst tab first"
+          error: "Open a NAPA, O'Reilly, WebEst, Auto Integrate, or eRepair tab first"
         });
         return;
       }
@@ -554,7 +573,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: "Open a NAPA, O'Reilly, or WebEst tab first"
+          error: "Open a NAPA, O'Reilly, WebEst, Auto Integrate, or eRepair tab first"
         });
         return;
       }
@@ -611,7 +630,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId == null) {
         sendResponse({
           ok: false,
-          error: "Open a NAPA, O'Reilly, or WebEst tab first"
+          error: "Open a NAPA, O'Reilly, WebEst, Auto Integrate, or eRepair tab first"
         });
         return;
       }

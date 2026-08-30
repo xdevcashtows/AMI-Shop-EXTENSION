@@ -121,7 +121,13 @@ function setCartCount(count) {
 function supplierDisplayName(supplier, long) {
   if (supplier === 'napa') return long ? 'NAPA ProLink' : 'NAPA';
   if (supplier === 'webest') return 'WebEst';
+  if (supplier === 'autointegrate') return 'Auto Integrate';
+  if (supplier === 'erepair') return long ? 'eRepair / Wheels' : 'eRepair';
   return long ? "O'Reilly / FirstCall" : "O'Reilly";
+}
+
+function isFleetSyncSupplier(supplier) {
+  return supplier === 'autointegrate' || supplier === 'erepair';
 }
 
 function isLaborOnlyLine(line) {
@@ -229,12 +235,13 @@ function render() {
     els.fillVinBtn.disabled = true;
     els.fillVinBtn.classList.remove('hidden');
     els.transferBtn.disabled = true;
+    if (els.transferBtn) els.transferBtn.textContent = 'Transfer to Job Card';
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
     setPartSuppliesToggleVisible(false);
     renderEmptyState({
       title: 'No supplier tab selected',
-      hint: 'Switch to a NAPA, O’Reilly, or WebEst tab to see that job’s cart.'
+      hint: 'Switch to a NAPA, O’Reilly, WebEst, Auto Integrate, or eRepair tab to see that job’s cart.'
     });
     return;
   }
@@ -249,6 +256,7 @@ function render() {
     els.fillVinBtn.disabled = true;
     els.fillVinBtn.classList.remove('hidden');
     els.transferBtn.disabled = true;
+    if (els.transferBtn) els.transferBtn.textContent = 'Transfer to Job Card';
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
     setPartSuppliesToggleVisible(false);
@@ -261,10 +269,18 @@ function render() {
 
   const supplierLabel = supplierDisplayName(session.supplier, false);
   const isWebEst = session.supplier === 'webest';
+  const isFleetSync = isFleetSyncSupplier(session.supplier);
   const transferred = wasTransferred(session);
   els.subtitle.textContent = transferred
     ? 'Already transferred from this window'
-    : 'Shop, then transfer when ready';
+    : isFleetSync
+      ? 'Open the repair order, then sync this window'
+      : 'Shop, then transfer when ready';
+  if (els.transferBtn) {
+    els.transferBtn.textContent = isFleetSync
+      ? 'Sync to Job Card'
+      : 'Transfer to Job Card';
+  }
   els.supplierBadge.textContent = supplierLabel;
   els.supplierBadge.classList.remove('hidden');
   els.jobLabel.textContent = `${jobNumberLabel(session)} · ${supplierLabel}`;
@@ -291,11 +307,17 @@ function render() {
       return;
     }
     const supplierName = supplierDisplayName(session.supplier, true);
-    const emptyHint = isWebEst
-      ? `Add parts to the ${supplierName} estimate and they’ll show up here.`
-      : `Add parts to your ${supplierName} cart and they’ll show up here.`;
+    const emptyHint = isFleetSync
+      ? `Open a ${supplierName} repair order and the authorized lines will show up here.`
+      : isWebEst
+        ? `Add parts to the ${supplierName} estimate and they’ll show up here.`
+        : `Add parts to your ${supplierName} cart and they’ll show up here.`;
     renderEmptyState({
-      title: isWebEst ? 'No estimate lines' : 'Cart is empty',
+      title: isFleetSync
+        ? 'No repair-order lines'
+        : isWebEst
+          ? 'No estimate lines'
+          : 'Cart is empty',
       hint: emptyHint
     });
     return;
@@ -306,9 +328,15 @@ function render() {
   els.cartBody.innerHTML = '';
   lines.forEach((line, index) => {
     const laborOnly = isLaborOnlyLine(line);
-    const label = laborOnly
-      ? String(line.laborCategory || line.description || '').trim()
-      : String(line.description || '');
+    const kindLabel =
+      line.lineKind === 'labor' || laborOnly
+        ? 'LABOR'
+        : line.lineKind === 'part'
+          ? 'PART'
+          : '';
+    const label = [kindLabel, String(line.description || line.laborCategory || '').trim()]
+      .filter(Boolean)
+      .join(' · ');
     const hours =
       Number.isFinite(Number(line.laborHours)) && Number(line.laborHours) > 0
         ? String(line.laborHours)
@@ -326,7 +354,7 @@ function render() {
           ? `<td class="hours-cell num" title="${escapeHtml(hoursTitle)}">${escapeHtml(hours)}</td>`
           : ''
       }
-      <td class="cost-cell">${laborOnly ? '—' : money(line.cost)}</td>
+      <td class="cost-cell">${laborOnly ? money(line.sellPrice ?? line.cost) : money(line.cost)}</td>
     `;
 
     const qtyCell = tr.querySelector('.qty-cell');
@@ -414,7 +442,7 @@ async function load() {
   }
   currentSession = response?.session || null;
   activeTabIsSupplier = Boolean(
-    response?.isSupplierTab ?? (tab && /web-est|napaprolink|firstcallonline|oreillyauto/.test(tab.url || ''))
+    response?.isSupplierTab ?? (tab && /web-est|napaprolink|firstcallonline|oreillyauto|autointegrate|erepair\.wheels/.test(tab.url || ''))
   );
   if (response?.tabId != null) currentTabId = response.tabId;
   render();
@@ -535,6 +563,15 @@ els.clearBtn.addEventListener('click', async () => {
 
 els.transferBtn.addEventListener('click', async () => {
   if (!currentSession?.lines?.length) return;
+  if (isFleetSyncSupplier(currentSession.supplier)) {
+    const jobLabel = currentSession.jobNumber
+      ? `job card #${currentSession.jobNumber}`
+      : 'this job card';
+    const confirmed = window.confirm(
+      `Replace all parts and labor on ${jobLabel} with the ${currentSession.lines.length} line(s) from this window?`
+    );
+    if (!confirmed) return;
+  }
   const count = currentSession.lines.length;
   const jobLabel = currentSession.jobNumber
     ? `#${currentSession.jobNumber}`
@@ -562,8 +599,11 @@ els.transferBtn.addEventListener('click', async () => {
   }
   render();
   const jobSuffix = jobLabel ? ` to job card ${jobLabel}` : ' to the job card';
+  const action = isFleetSyncSupplier(currentSession?.supplier)
+    ? 'Synced'
+    : 'Transferred';
   setStatus(
-    `Transferred ${count} part${count === 1 ? '' : 's'}${jobSuffix}`,
+    `${action} ${count} line${count === 1 ? '' : 's'}${jobSuffix}`,
     'ok'
   );
 });

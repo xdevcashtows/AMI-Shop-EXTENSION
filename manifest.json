@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AMI Parts Bridge",
-  "version": "0.3.13",
-  "description": "Chrome side panel that mirrors NAPA / O'Reilly carts and WebEst estimate lines, then transfers them into AMI Shop CRM job cards.",
+  "version": "0.3.16",
+  "description": "Chrome side panel that mirrors NAPA / O'Reilly carts, WebEst estimates, and Auto Integrate / eRepair repair orders, then transfers them into AMI Shop CRM job cards.",
   "permissions": ["storage", "tabs", "sidePanel"],
   "host_permissions": [
     "http://localhost:5173/*",
@@ -17,7 +17,10 @@
     "https://pro.napaprolink.com/*",
     "https://*.napaprolink.com/*",
     "https://proestimator.web-est.com/*",
-    "https://*.web-est.com/*"
+    "https://*.web-est.com/*",
+    "https://online.autointegrate.com/*",
+    "https://api.autointegrate.com/*",
+    "https://erepair.wheels.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -39,7 +42,10 @@
         "https://pro.napaprolink.com/*",
         "https://*.napaprolink.com/*",
         "https://proestimator.web-est.com/*",
-        "https://*.web-est.com/*"
+        "https://*.web-est.com/*",
+        "https://online.autointegrate.com/*",
+        "https://api.autointegrate.com/*",
+        "https://erepair.wheels.com/*"
       ]
     }
   ],
@@ -102,6 +108,36 @@
       ],
       "run_at": "document_start",
       "all_frames": true
+    },
+    {
+      "matches": ["https://online.autointegrate.com/*"],
+      "js": ["content/page-network-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://online.autointegrate.com/*"],
+      "js": [
+        "content/safe-chrome.js",
+        "content/autointegrate-cart.js",
+        "content/supplier-bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://erepair.wheels.com/*"],
+      "js": ["content/page-network-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://erepair.wheels.com/*"],
+      "js": [
+        "content/safe-chrome.js",
+        "content/erepair-cart.js",
+        "content/supplier-bridge.js"
+      ],
+      "run_at": "document_start"
     }
   ],
   "icons": {
