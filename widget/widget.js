@@ -192,9 +192,9 @@ function buildPartSuppliesLine(hours) {
     description: 'Part Supplies',
     laborCategory: 'Part Supplies',
     laborHours: hours,
-    quantity: 0,
+    quantity: hours,
     cost: 0,
-    lineKind: 'labor',
+    lineKind: 'part',
     vendor: 'WebEst'
   };
 }
