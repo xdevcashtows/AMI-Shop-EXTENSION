@@ -6,7 +6,7 @@
     <title>AMI Parts Bridge</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
-  <body>
+  <body class="layout-shop">
     <header class="header">
       <div class="brand">
         <img class="brand-logo" src="../icons/icon128.png" alt="" width="36" height="36" />
@@ -25,9 +25,10 @@
             <div class="label">Job</div>
             <div id="jobLabel" class="value">—</div>
           </div>
-          <div class="actions">
+          <div class="actions shop-only">
             <button type="button" id="copyVinBtn" class="btn secondary" disabled>Copy VIN</button>
             <button type="button" id="fillVinBtn" class="btn secondary" disabled>Fill VIN</button>
+            <button type="button" id="refreshBtn" class="btn secondary">Refresh</button>
           </div>
         </div>
         <div class="vin-box">
@@ -43,7 +44,7 @@
       <section class="card cart-card">
         <div class="cart-header">
           <div class="cart-title-row">
-            <h2>Shop Cart</h2>
+            <h2 id="cartTitle">Shop Cart</h2>
             <span id="cartCount" class="count-pill hidden">0</span>
           </div>
           <label id="partSuppliesToggle" class="part-supplies-toggle hidden">
@@ -64,6 +65,7 @@
                 <th>Part #</th>
                 <th>Description</th>
                 <th class="num">Qty</th>
+                <th id="hoursColHeader" class="num hours-col hidden">Hrs</th>
                 <th class="num">Cost</th>
               </tr>
             </thead>
@@ -76,7 +78,10 @@
     <p id="status" class="status" role="status"></p>
 
     <footer class="footer">
-      <button type="button" id="clearBtn" class="btn secondary">Clear</button>
+      <button type="button" id="clearBtn" class="btn secondary shop-only">Clear</button>
+      <button type="button" id="extractBtn" class="btn secondary fleet-only hidden">
+        Extract Data
+      </button>
       <button type="button" id="transferBtn" class="btn primary" disabled>
         Transfer to Job Card
       </button>

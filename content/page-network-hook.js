@@ -8,7 +8,16 @@
   const WEBEST_GRID_SOURCE = 'ami-parts-bridge-read-webest-grid';
   const WEBEST_DELETE_SOURCE = 'ami-parts-bridge-webest-delete';
   const WEBEST_FILL_VIN_SOURCE = 'ami-parts-bridge-webest-fill-vin';
+  const REPAIR_ORDER_READ_SOURCE = 'ami-parts-bridge-read-repair-order';
+  const REPAIR_ORDER_CACHE_SOURCE = 'ami-parts-bridge-repair-order-cache';
   const DEFAULT_NAPA_CART_PREFIX = '/occ/v2/prolinkus/users/current/carts/';
+
+  /** @type {string | object | null} */
+  let lastRepairOrderBody = null;
+  /** @type {string} */
+  let lastRepairOrderUrl = '';
+  /** @type {Record<string, string>} */
+  let lastAutoIntegrateHeaders = {};
 
   /** @type {Record<string, string>} */
   let lastWebEstHeaders = {};
@@ -410,7 +419,124 @@
     }
   }
 
+  function isRepairOrderUrl(url) {
+    return /\/RepairOrders\/\d+(?!\d)(?!\/)/i.test(String(url || ''));
+  }
+
+  function repairOrderIdFromUrl(url) {
+    const match = String(url || '').match(/\/RepairOrders\/(\d+)(?!\d)(?!\/)/i);
+    return match ? match[1] : '';
+  }
+
+  function repairOrderIdFromPage(hint) {
+    const hinted = String(hint || '').trim();
+    if (/^\d+$/.test(hinted)) return hinted;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const jsId = String(params.get('jsId') || '').trim();
+      if (/^\d+$/.test(jsId)) return jsId;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      const match = String(window.location.href).match(/[?&]jsId=(\d+)/i);
+      if (match) return match[1];
+    } catch (_) {
+      // ignore
+    }
+    return repairOrderIdFromUrl(lastRepairOrderUrl);
+  }
+
+  function rememberAutoIntegrateHeaders(headers, url) {
+    try {
+      if (!headers || !/\/RepairOrders\//i.test(String(url || ''))) return;
+      /** @type {Record<string, string>} */
+      const next = {};
+      const keep = [
+        'accept',
+        'authorization',
+        'content-type',
+        'x-autointegrate-correlationid',
+        'x-autointegrate-enable-localization'
+      ];
+      const read = (name) => {
+        if (typeof headers.get === 'function') return headers.get(name);
+        if (typeof headers === 'object') {
+          const found = Object.keys(headers).find(
+            (k) => k.toLowerCase() === name.toLowerCase()
+          );
+          return found ? headers[found] : null;
+        }
+        return null;
+      };
+      keep.forEach((name) => {
+        const value = read(name);
+        if (value) next[name] = String(value);
+      });
+      if (Object.keys(next).length) {
+        lastAutoIntegrateHeaders = { ...lastAutoIntegrateHeaders, ...next };
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function rememberRepairOrder(url, body, kind) {
+    if (kind && kind !== 'response') return;
+    if (!isRepairOrderUrl(url)) return;
+    if (body == null || body === '') return;
+    lastRepairOrderUrl = String(url || '');
+    lastRepairOrderBody = body;
+  }
+
+  function postRepairOrderCache(body, url) {
+    window.postMessage(
+      {
+        source: REPAIR_ORDER_CACHE_SOURCE,
+        url: url || lastRepairOrderUrl,
+        body: body != null ? body : lastRepairOrderBody
+      },
+      '*'
+    );
+  }
+
+  function replyRepairOrderCache(hintId) {
+    const pageId = repairOrderIdFromPage(hintId);
+    const cachedId = repairOrderIdFromUrl(lastRepairOrderUrl);
+    if (lastRepairOrderBody && cachedId && (!pageId || cachedId === pageId)) {
+      postRepairOrderCache(lastRepairOrderBody, lastRepairOrderUrl);
+      return;
+    }
+    if (!pageId || !origFetch) {
+      postRepairOrderCache(lastRepairOrderBody, lastRepairOrderUrl);
+      return;
+    }
+    const url = `https://api.autointegrate.com/RepairOrders/${pageId}`;
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'content-type': 'application/json',
+      ...lastAutoIntegrateHeaders
+    };
+    origFetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      headers,
+      cache: 'no-store'
+    })
+      .then((response) => response.text().then((text) => ({ response, text })))
+      .then(({ response, text }) => {
+        if (response.ok && text) {
+          emit(response.url || url, text, 'response', 'GET', response.status);
+        }
+        postRepairOrderCache(lastRepairOrderBody || text, lastRepairOrderUrl || url);
+      })
+      .catch(() => {
+        postRepairOrderCache(lastRepairOrderBody, lastRepairOrderUrl);
+      });
+  }
+
   function emit(url, body, kind, method, status, extra) {
+    rememberRepairOrder(url, body, kind);
     try {
       window.postMessage(
         {
@@ -569,6 +695,11 @@
     if (event.source !== window) return;
     const data = event.data;
     if (!data) return;
+
+    if (data.source === REPAIR_ORDER_READ_SOURCE) {
+      replyRepairOrderCache(data.jsId);
+      return;
+    }
 
     if (data.source === FETCH_SOURCE) {
       const worksheetId = String(data.worksheetId || '').trim();
@@ -913,6 +1044,7 @@
             rememberNapaCartHeaders(hdrs, url);
             rememberWebEstHeaders(hdrs, url);
             rememberWebEstActionUrl(url);
+            rememberAutoIntegrateHeaders(hdrs, url);
           }
         } catch (_) {
           // ignore
@@ -979,6 +1111,7 @@
         const method = String(this.__amiMethod || 'GET').toUpperCase();
         rememberWebEstHeaders(this.__amiHeaders, this.__amiUrl || '');
         rememberWebEstActionUrl(this.__amiUrl || '');
+        rememberAutoIntegrateHeaders(this.__amiHeaders, this.__amiUrl || '');
         if (method !== 'GET' && method !== 'HEAD' && args[0] != null) {
           emit(this.__amiUrl || '', bodyToText(args[0]), 'request', method);
         }

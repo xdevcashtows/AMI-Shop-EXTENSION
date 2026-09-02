@@ -60,6 +60,7 @@ const els = {
   copyVinBtn: document.getElementById('copyVinBtn'),
   fillVinBtn: document.getElementById('fillVinBtn'),
   refreshBtn: document.getElementById('refreshBtn'),
+  cartTitle: document.getElementById('cartTitle'),
   cartEmpty: document.getElementById('cartEmpty'),
   cartCount: document.getElementById('cartCount'),
   cartTable: document.getElementById('cartTable'),
@@ -69,8 +70,11 @@ const els = {
   partSuppliesEnabled: document.getElementById('partSuppliesEnabled'),
   status: document.getElementById('status'),
   clearBtn: document.getElementById('clearBtn'),
+  extractBtn: document.getElementById('extractBtn'),
   transferBtn: document.getElementById('transferBtn')
 };
+
+let extracting = false;
 
 function setStatus(text, kind) {
   els.status.textContent = text || '';
@@ -79,8 +83,13 @@ function setStatus(text, kind) {
 }
 
 function money(value) {
-  if (value == null || !Number.isFinite(Number(value))) return '—';
-  return `$${Number(value).toFixed(2)}`;
+  if (value == null || value === '') return '—';
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '—';
+  return amount.toLocaleString('en-US', {
+    style: 'currency',
+    currency: 'USD'
+  });
 }
 
 function ymmText(vehicle) {
@@ -209,6 +218,25 @@ function jobNumberLabel(session) {
   return 'Draft job';
 }
 
+function applyChrome({ fleet, hasSession, hasVin }) {
+  document.body.classList.toggle('layout-fleet', fleet);
+  document.body.classList.toggle('layout-shop', !fleet);
+  if (els.cartTitle) {
+    els.cartTitle.textContent = fleet ? 'Repair Order' : 'Shop Cart';
+  }
+  els.copyVinBtn?.classList.toggle('hidden', fleet);
+  els.fillVinBtn?.classList.toggle('hidden', fleet);
+  els.refreshBtn?.classList.toggle('hidden', fleet);
+  els.clearBtn?.classList.toggle('hidden', fleet);
+  els.extractBtn?.classList.toggle('hidden', !fleet);
+  if (els.copyVinBtn) els.copyVinBtn.disabled = fleet || !hasVin;
+  if (els.fillVinBtn) els.fillVinBtn.disabled = fleet || !hasVin;
+  if (els.extractBtn) els.extractBtn.disabled = !hasSession || extracting;
+  if (els.transferBtn) {
+    els.transferBtn.textContent = fleet ? 'Update Job Card' : 'Transfer to Job Card';
+  }
+}
+
 function wasTransferred(session) {
   return Boolean(session?.transferredAt) && !(session?.lines || []).length;
 }
@@ -226,16 +254,13 @@ function renderEmptyState({ title, hint }) {
 function render() {
   const session = currentSession;
   if (!activeTabIsSupplier) {
+    applyChrome({ fleet: false, hasSession: false, hasVin: false });
     els.subtitle.textContent = 'Switch to a supplier tab';
     els.supplierBadge.classList.add('hidden');
     els.jobLabel.textContent = '—';
     els.ymmLabel.textContent = '—';
     els.vehicleLabel.innerHTML = '—';
-    els.copyVinBtn.disabled = true;
-    els.fillVinBtn.disabled = true;
-    els.fillVinBtn.classList.remove('hidden');
     els.transferBtn.disabled = true;
-    if (els.transferBtn) els.transferBtn.textContent = 'Transfer to Job Card';
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
     setPartSuppliesToggleVisible(false);
@@ -247,16 +272,13 @@ function render() {
   }
 
   if (!session) {
+    applyChrome({ fleet: false, hasSession: false, hasVin: false });
     els.subtitle.textContent = 'No active session — start from a job card';
     els.supplierBadge.classList.add('hidden');
     els.jobLabel.textContent = '—';
     els.ymmLabel.textContent = '—';
     els.vehicleLabel.innerHTML = '—';
-    els.copyVinBtn.disabled = true;
-    els.fillVinBtn.disabled = true;
-    els.fillVinBtn.classList.remove('hidden');
     els.transferBtn.disabled = true;
-    if (els.transferBtn) els.transferBtn.textContent = 'Transfer to Job Card';
     setCartCount(0);
     els.hoursColHeader?.classList.add('hidden');
     setPartSuppliesToggleVisible(false);
@@ -271,24 +293,21 @@ function render() {
   const isWebEst = session.supplier === 'webest';
   const isFleetSync = isFleetSyncSupplier(session.supplier);
   const transferred = wasTransferred(session);
+  applyChrome({
+    fleet: isFleetSync,
+    hasSession: true,
+    hasVin: Boolean(session.vehicle?.vin)
+  });
   els.subtitle.textContent = transferred
     ? 'Already transferred from this window'
     : isFleetSync
-      ? 'Open the repair order, then sync this window'
+      ? 'Open the repair order, then extract'
       : 'Shop, then transfer when ready';
-  if (els.transferBtn) {
-    els.transferBtn.textContent = isFleetSync
-      ? 'Sync to Job Card'
-      : 'Transfer to Job Card';
-  }
   els.supplierBadge.textContent = supplierLabel;
   els.supplierBadge.classList.remove('hidden');
   els.jobLabel.textContent = `${jobNumberLabel(session)} · ${supplierLabel}`;
   els.ymmLabel.textContent = ymmText(session.vehicle);
   els.vehicleLabel.innerHTML = renderVinHtml(session.vehicle);
-  els.copyVinBtn.disabled = !session.vehicle?.vin;
-  els.fillVinBtn.classList.remove('hidden');
-  els.fillVinBtn.disabled = !session.vehicle?.vin;
 
   const lines = Array.isArray(session.lines) ? session.lines : [];
   const showHours =
@@ -301,14 +320,16 @@ function render() {
     setPartSuppliesToggleVisible(false);
     if (transferred) {
       renderEmptyState({
-        title: 'Transferred',
-        hint: 'This window is no longer waiting on the job card. You can close it, or keep shopping to transfer more items.'
+        title: isFleetSync ? 'Job card updated' : 'Transferred',
+        hint: isFleetSync
+          ? 'This window is no longer waiting on the job card. Open another repair order and extract again if you need to update it.'
+          : 'This window is no longer waiting on the job card. You can close it, or keep shopping to transfer more items.'
       });
       return;
     }
     const supplierName = supplierDisplayName(session.supplier, true);
     const emptyHint = isFleetSync
-      ? `Open a ${supplierName} repair order and the authorized lines will show up here.`
+      ? `Open a ${supplierName} repair order, dismiss any notices, then click Extract Data.`
       : isWebEst
         ? `Add parts to the ${supplierName} estimate and they’ll show up here.`
         : `Add parts to your ${supplierName} cart and they’ll show up here.`;
@@ -561,6 +582,36 @@ els.clearBtn.addEventListener('click', async () => {
   render();
 });
 
+els.extractBtn?.addEventListener('click', async () => {
+  if (!currentSession || extracting) return;
+  extracting = true;
+  els.extractBtn.disabled = true;
+  setStatus('Extracting repair-order lines…');
+  try {
+    const response = await sendMessage({ type: 'AMI_SCRAPE_NOW' });
+    if (response?.ok === false && response.error) {
+      setStatus(response.error, 'err');
+      return;
+    }
+    const extracted = Number(response?.count) || 0;
+    await load();
+    if (extracted) {
+      setStatus(
+        `Extracted ${extracted} line${extracted === 1 ? '' : 's'}`,
+        'ok'
+      );
+    } else {
+      setStatus(
+        'No repair-order lines found. Dismiss any popups, open the repair order, then try again.',
+        'err'
+      );
+    }
+  } finally {
+    extracting = false;
+    render();
+  }
+});
+
 els.transferBtn.addEventListener('click', async () => {
   if (!currentSession?.lines?.length) return;
   if (isFleetSyncSupplier(currentSession.supplier)) {
@@ -600,7 +651,7 @@ els.transferBtn.addEventListener('click', async () => {
   render();
   const jobSuffix = jobLabel ? ` to job card ${jobLabel}` : ' to the job card';
   const action = isFleetSyncSupplier(currentSession?.supplier)
-    ? 'Synced'
+    ? 'Updated'
     : 'Transferred';
   setStatus(
     `${action} ${count} line${count === 1 ? '' : 's'}${jobSuffix}`,

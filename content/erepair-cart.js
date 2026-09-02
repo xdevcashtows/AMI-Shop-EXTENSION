@@ -163,7 +163,6 @@
       const lines = parseOrderDetailRoot(doc);
       if (!lines) return false;
       networkLines = lines;
-      void pushCartUpdate();
       return true;
     } catch {
       return false;
@@ -174,8 +173,23 @@
     const lines = parseOrderDetailRoot(document);
     if (!lines) return false;
     networkLines = lines;
-    void pushCartUpdate();
     return true;
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function extractNow() {
+    scrapeDom();
+    if (!networkLines.length) {
+      await wait(600);
+      scrapeDom();
+    }
+    if (networkLines.length) {
+      await pushCartUpdate(true);
+    }
+    return networkLines;
   }
 
   function isViewDetailUrl(url) {
@@ -252,15 +266,19 @@
 
   window.addEventListener('ami-parts-bridge-reset-cart', resetCart);
   window.addEventListener('ami-parts-bridge-scrape-now', () => {
-    scrapeDom();
-    void pushCartUpdate(true);
+    void extractNow();
   });
 
   Ami?.onRuntimeMessage?.((message, _sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
     if (message.type === 'AMI_SCRAPE_NOW') {
-      scrapeDom();
-      void pushCartUpdate(true).then(() => sendResponse({ ok: true }));
+      void extractNow().then((lines) =>
+        sendResponse({
+          ok: true,
+          count: lines.length,
+          lines
+        })
+      );
       return true;
     }
     if (message.type === 'AMI_SESSION_UPDATED' && message.resetCart) {
