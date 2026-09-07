@@ -159,11 +159,13 @@ function normalizeLaborCategory(value) {
 function isSuppliesActivityCategory(value) {
   const normalized = normalizeLaborCategory(value);
   return (
-    normalized === 'body' ||
     normalized === 'paint panel' ||
     normalized === 'paint' ||
     normalized === 'clearcoat' ||
-    normalized === 'clear coat'
+    normalized === 'clear coat' ||
+    normalized === 'underside' ||
+    normalized === 'blend' ||
+    normalized === 'edging'
   );
 }
 
@@ -189,8 +191,8 @@ function isPartSuppliesEnabled(session) {
 function buildPartSuppliesLine(hours) {
   return {
     partNumber: '',
-    description: 'Part Supplies',
-    laborCategory: 'Part Supplies',
+    description: 'Paint Supplies',
+    laborCategory: 'Paint Supplies',
     laborHours: hours,
     quantity: hours,
     cost: 0,
@@ -416,7 +418,7 @@ function render() {
     tr.className = 'part-supplies-row';
     tr.innerHTML = `
       <td class="part-cell">—</td>
-      <td class="desc-cell" title="Part Supplies">Part Supplies</td>
+      <td class="desc-cell" title="Paint Supplies">Paint Supplies</td>
       <td class="qty-cell num">—</td>
       ${
         showHours
@@ -425,7 +427,7 @@ function render() {
       }
       <td class="cost-cell">
         <span>—</span>
-        <button type="button" class="part-supplies-remove" aria-label="Hide Part Supplies" title="Hide Part Supplies">×</button>
+        <button type="button" class="part-supplies-remove" aria-label="Hide Paint Supplies" title="Hide Paint Supplies">×</button>
       </td>
     `;
     tr.querySelector('.part-supplies-remove')?.addEventListener('click', () => {
